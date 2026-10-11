@@ -1,0 +1,41 @@
+// The pool every test starts from: two swimmers, a cashier, a lifeguard, and four plans.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Memberships;
+
+principal Ada => User.Single(u => u.Email == "ada@pool.test");
+principal Bo => User.Single(u => u.Email == "bo@pool.test");
+principal Cass => User.Single(u => u.Email == "cass@pool.test");
+principal Lee => User.Single(u => u.Email == "lee@pool.test");
+
+[TestFixture]
+void Pool() {
+  var ada = new User { Email = "ada@pool.test", DisplayName = "Ada Moreno" };
+  var bo = new User { Email = "bo@pool.test", DisplayName = "Bo Lindqvist" };
+  var cass = new User { Email = "cass@pool.test", DisplayName = "Cass Okafor" };
+  var lee = new User { Email = "lee@pool.test", DisplayName = "Lee Haddad" };
+  new RoleGrant { Member = ada, Role = PoolRole.Swimmer };
+  new RoleGrant { Member = bo, Role = PoolRole.Swimmer };
+  new RoleGrant { Member = cass, Role = PoolRole.Cashier };
+  new RoleGrant { Member = lee, Role = PoolRole.Lifeguard };
+  new MembershipPlan { Name = "Day ticket", Price = 6m, Currency = "EUR", Periods = 1, Period = PlanPeriod.Day, SortOrder = 1 };
+  new MembershipPlan { Name = "Monthly", Price = 45m, Currency = "EUR", Periods = 1, Period = PlanPeriod.Month, MaxPauseDays = 30,
+                       Renewable = true, SortOrder = 2 };
+  new MembershipPlan { Name = "Ten swims", Price = 50m, Currency = "EUR", Periods = 12, Period = PlanPeriod.Month, Visits = 10,
+                       StartsOnFirstVisit = true, SortOrder = 3 };
+  new MembershipPlan { Name = "Family year", Price = 400m, Currency = "EUR", Periods = 1, Period = PlanPeriod.Year, People = 4,
+                       Renewable = true, SortOrder = 4 };
+  new MembershipPlan { Name = "Summer special", Price = 20m, Currency = "EUR", Periods = 2, Period = PlanPeriod.Week, OnSale = false };
+}
+
+MembershipPlan Plan(string name) { return MembershipPlan.Single(p => p.Name == name); }
+
+int HeardCount(string what) { return Heard.Count(h => h.Event == what); }
+
+/// Sell `plan` to `holder` as the cashier.
+Membership Sold(Principal holder, string plan) {
+  Membership? m = null;
+  runas(Cass) { m = SellMembership(holder, Plan(plan)); }
+  return m!;
+}

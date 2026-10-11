@@ -1,0 +1,99 @@
+// The rules declared on the data, each proved as the person it is about — and what the kit tells the pool.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+[Test(Pool)]
+[runas(Cass)]
+void even_the_cashier_cannot_write_a_membership_s_dates_or_visits_directly() {
+  var m = SellMembership(Ada, Plan("Ten swims"));
+  Assert.Denied(() => { m.ValidUntil = DateTime.UtcNow.AddYears(5); UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.ValidFrom = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.PausedDays = 0; m.PausedAt = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.EndedAt = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { new Membership { Holder = Bo, Plan = Plan("Monthly") }; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.Delete(); UnitOfWork.Commit(); });
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_cannot_sell_themself_a_membership_or_change_a_plan() {
+  Assert.Denied(() => SellMembership(Ada, Plan("Family year")));
+  var plan = Plan("Monthly");
+  Assert.Denied(() => { plan.Price = 1m; UnitOfWork.Commit(); });
+  Assert.Denied(() => RenewMembership(Sold(Ada, "Monthly")));
+  Assert.Denied(() => ExtendMembership(Sold(Ada, "Monthly"), DateTime.UtcNow.AddYears(1), "mine"));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void nobody_forges_an_admission_or_a_change() {
+  var m = Sold(Ada, "Ten swims");
+  Assert.Denied(() => { new Admission { Person = Bo, Membership = m }; UnitOfWork.Commit(); });
+  Assert.Denied(() => { new MembershipChange { Membership = m, Kind = MembershipChangeKind.Extend, Until = DateTime.UtcNow.AddYears(3) }; UnitOfWork.Commit(); });
+  var a = CheckIn(Ada);
+  Assert.Denied(() => { a.VisitsLeft = 99; UnitOfWork.Commit(); });
+  Assert.Denied(() => { a.Reason = "changed"; UnitOfWork.Commit(); });
+}
+
+[Test(Pool)]
+[runas(Bo)]
+void a_swimmer_cannot_check_somebody_in_end_or_sell() {
+  var m = Sold(Ada, "Monthly");
+  Assert.Denied(() => CheckIn(Ada));
+  Assert.Denied(() => EndMembership(m, "spite"));
+  Assert.Denied(() => UndoAdmission(CheckInAsTheGate(Ada)));
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_reads_their_own_memberships_and_check_ins_and_nobody_elses() {
+  Sold(Ada, "Monthly");
+  Sold(Bo, "Day ticket");
+  CheckInAsTheGate(Ada);
+  CheckInAsTheGate(Bo);
+  Assert.Equal(1, Membership.Count());
+  Assert.Equal(1, Admission.Count());
+  Assert.Equal(0, MembershipsOf(Bo).Count);
+  runas(Lee) { Assert.Equal(2, Membership.Count()); Assert.Equal(2, Admission.Count()); }
+}
+
+[Test(Pool)]
+[runas(Bo)]
+void somebody_on_a_family_membership_sees_it() {
+  Membership? m = null;
+  runas(Cass) { m = SellMembership(Ada, Plan("Family year")); }
+  Assert.Equal(0, Membership.Count());
+  runas(Ada) { AddToMembership(m!, Bo); }
+  Assert.Equal(1, MembershipsOf(Bo).Count);
+  Assert.True(EntryFor(Bo).CanEnter);
+}
+
+[Test(Pool)]
+void nobody_signed_in_may_do_anything() {
+  // Nobody's account is readable to a visitor, so to them it does not exist: refused before the body starts.
+  Assert.Throws(() => CheckIn(Ada));
+  Assert.Throws(() => SellMembership(Ada, Plan("Monthly")));
+  Assert.Equal(5, MembershipPlan.Count());          // the price list is public
+}
+
+// ── what the kit tells the pool ─────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Pool)]
+[runas(Cass)]
+void each_sale_refusal_pause_and_transfer_is_heard_once() {
+  var m = SellMembership(Ada, Plan("Monthly"), "o-1");
+  SellMembership(Ada, Plan("Monthly"), "o-1");
+  runas(Lee) { CheckIn(Bo); }
+  PauseMembership(m, DateTime.UtcNow.AddDays(3), "Holiday");
+  TransferMembership(SellMembership(Ada, Plan("Day ticket")), Bo, "Could not come");
+  Background.Settle();
+  Assert.Equal(2, HeardCount("sold"));
+  Assert.Equal(1, Heard.Count(h => h.Event == "refused" && h.Detail == "No membership on record."));
+  Assert.Equal(1, HeardCount("paused"));
+  Assert.Equal(1, Heard.Count(h => h.Event == "transferred" && h.Detail == "Bo Lindqvist"));
+  Assert.Equal(1, Heard.Count(h => h.Event == "ended" && h.Detail.StartsWith("Day ticket:transferred to")));
+}

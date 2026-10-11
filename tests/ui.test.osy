@@ -1,0 +1,132 @@
+// The kit's pages, driven as each person drives them. `osy test --pixels` photographs each (Ui.Shot) — the README's
+// screenshots are these.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.Memberships;
+
+/// A pool a few weeks in: Ada swims on a monthly, Bo has used two swims of a card.
+[TestFixture]
+void SeasonUnderway() {
+  Pool();
+  var ada = User.Single(u => u.Email == "ada@pool.test");
+  var bo = User.Single(u => u.Email == "bo@pool.test");
+  new MembershipPlan { Name = "Weekend pass", Price = 15m, Currency = "EUR", Periods = 1, Period = PlanPeriod.Week, SortOrder = 5,
+                       Description = "Saturday and Sunday, as often as you like." };
+}
+
+[Test(SeasonUnderway)]
+[runas(Cass)]
+void a_swimmer_sees_what_lets_them_in_and_pauses_it() {
+  Sold(Ada, "Monthly");
+  CheckInAsTheGate(Ada);
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Ada);
+  Ui.Visit("/memberships");
+  Assert.Visible("You can come in");
+  Assert.Visible("Monthly", within: "Memberships");
+  Assert.Visible("Unlimited", within: "Monthly");
+  Ui.Shot("memberships-mine");
+  Ui.Click("Pause", within: "Monthly");
+  Assert.Visible("Monthly is paused. Resume it whenever you like.");
+  Assert.Visible("You cannot come in right now");
+  Ui.Click("Resume", within: "Monthly");
+  Assert.Visible("You can come in");
+}
+
+[Test(SeasonUnderway)]
+void the_gate_finds_a_swimmer_sees_they_may_not_come_in_sells_a_card_and_checks_them_in() {
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Lee);
+  Ui.Visit("/staff/memberships");
+  Ui.Fill("Find a person", "bo");
+  Ui.Click("Find");
+  Ui.Click("Bo Lindqvist", within: "People found");
+  Assert.Visible("May not come in");
+  Assert.Visible("No membership on record.");
+  Ui.Click("Check in");
+  Assert.Visible("No membership on record.", within: "Today at the door");
+  Ui.SignInAs(Cass);
+  Ui.Visit("/staff/memberships");
+  Ui.Fill("Find a person", "bo");
+  Ui.Click("Find");
+  Ui.Click("Bo Lindqvist", within: "People found");
+  Ui.Click("Sell a membership");
+  Assert.Dialog("Sell Bo Lindqvist a membership");
+  Ui.Select("Plan", Plan("Ten swims"));
+  Ui.Shot("memberships-sell");
+  Ui.Click("Sell it");
+  Assert.Visible("Bo Lindqvist has Ten swims.");
+  Assert.Visible("May come in");
+  CheckInAsTheGate(Bo);
+  Ui.SignInAs(Lee);
+  Ui.Visit("/staff/memberships");
+  Ui.Fill("Find a person", "bo");
+  Ui.Click("Find");
+  Ui.Click("Bo Lindqvist", within: "People found");
+  Ui.Fill("Where", "Main entrance");
+  Ui.Click("Check in");
+  Assert.Visible("Bo Lindqvist is checked in.");
+  Assert.Visible("8 of 10", within: "Ten swims");
+  Ui.Shot("memberships-desk");
+}
+
+[Test(SeasonUnderway)]
+[runas(Cass)]
+void the_cashier_ends_a_membership_with_a_reason() {
+  Sold(Ada, "Monthly");
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Cass);
+  Ui.Visit("/staff/memberships");
+  Ui.Fill("Find a person", "ada");
+  Ui.Click("Find");
+  Ui.Click("Ada Moreno", within: "People found");
+  Ui.Click("End", within: "Monthly");
+  Assert.Dialog("End Monthly?");
+  Ui.Fill("Why (kept with the change)", "Moving abroad; refunded the rest");
+  Ui.Click("End it");
+  Assert.Visible("Monthly has ended.");
+  Assert.Visible("May not come in");
+}
+
+[Test(SeasonUnderway)]
+void the_cashier_adds_a_plan_and_it_is_on_the_price_list() {
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Cass);
+  Ui.Visit("/staff/memberships/plans");
+  Ui.Click("Add a plan");
+  Ui.Fill("Name", "Student term");
+  Ui.Fill("Price", "90");
+  Ui.Fill("Currency", "EUR");
+  Ui.Fill("Lasts", "4");
+  Ui.Click("Save");
+  Assert.Visible("Student term is saved.");
+  Assert.Visible("4 months · unlimited", within: "Student term");
+  Ui.Shot("memberships-plans");
+  Ui.Visit("/");
+  Assert.Visible("90.00 EUR", within: "Student term");
+  Ui.Click("Buy", within: "Weekend pass");
+  Assert.Visible("Next: paying for Weekend pass.");
+  Ui.Shot("memberships-join");
+}
+
+[Test(SeasonUnderway)]
+[runas(Cass)]
+void the_pages_fit_a_phone_and_read_in_the_dark() {
+  Sold(Ada, "Family year");
+  Ui.SignInAs(Ada);
+  Ui.Viewport(390, 844);
+  Ui.Visit("/memberships");
+  Assert.Visible("Family year", within: "Memberships");
+  Assert.NoOverflow();
+  Ui.Shot("memberships-mine-phone");
+  Ui.Viewport(1440, 900);
+  Ui.Theme("dark");
+  Ui.SignInAs(Lee);
+  Ui.Visit("/staff/memberships");
+  Ui.Fill("Find a person", "ada");
+  Ui.Click("Find");
+  Ui.Click("Ada Moreno", within: "People found");
+  Assert.Visible("May come in");
+  Ui.Shot("memberships-desk-dark");
+}

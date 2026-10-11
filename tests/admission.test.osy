@@ -1,0 +1,143 @@
+// Selling and letting people in: what a membership lets its holder do, a visit used and never below zero, and the
+// plain sentence when somebody may not enter.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+[Test(Pool)]
+[runas(Cass)]
+void a_monthly_membership_runs_a_month_from_today() {
+  var m = SellMembership(Ada, Plan("Monthly"), "till-1");
+  Assert.True(m.Unlimited);
+  Assert.True(m.ValidUntil > DateTime.UtcNow.AddDays(27));
+  Assert.True(m.ValidUntil < DateTime.UtcNow.AddDays(32));
+  Assert.Equal(45m, m.Price);
+  Assert.True(EntryFor(Ada).CanEnter);
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void selling_with_the_same_reference_twice_sells_one() {
+  var first = SellMembership(Ada, Plan("Day ticket"), "order-1041-1");
+  var again = SellMembership(Ada, Plan("Day ticket"), "order-1041-1");
+  Assert.Equal(first.Id, again.Id);
+  Assert.Equal(1, MembershipsOf(Ada).Count);
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_plan_withdrawn_from_sale_is_refused() {
+  Assert.Equal("Summer special is not on sale.",
+               Assert.Throws<ValidationException>(() => SellMembership(Ada, Plan("Summer special"))).Message);
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_card_of_ten_swims_is_a_pack_of_ten_credits_and_starts_on_the_first_swim() {
+  var m = SellMembership(Ada, Plan("Ten swims"));
+  var card = Membership.Include(x => x.Credits).Single(x => x.Id == m.Id);
+  Assert.Null(card.ValidFrom);
+  Assert.Equal(10, card.Credits.Granted);
+  Assert.Equal(5m, card.Credits.UnitValue);
+  Assert.Equal(10, VisitsLeftOn(card));
+  Assert.Equal("Starts on the first visit", MembershipStanding(card));
+  runas(Lee) {
+    var a = CheckIn(Ada, "Main gate");
+    Assert.Equal(AdmissionState.Admitted, a.State);
+    Assert.Equal(9, a.VisitsLeft);
+  }
+  var started = Membership.Single(x => x.Id == m.Id);
+  Assert.NotNull(started.ValidFrom);
+  Assert.True(started.ValidUntil > DateTime.UtcNow.AddMonths(11));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void each_swim_uses_one_visit_and_a_card_stops_at_zero_with_the_reason() {
+  Sold(Bo, "Ten swims");
+  for (var i = 0; i < 10; i++) { Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State); }
+  var eleventh = CheckIn(Bo, "Main gate");
+  Assert.Equal(AdmissionState.Refused, eleventh.State);
+  Assert.Equal("Ten swims has no visits left.", eleventh.Reason);
+  Assert.Equal(10, Admission.Count(a => a.State == AdmissionState.Admitted));
+  Assert.Equal(0, VisitsLeftOn(MembershipsOf(Bo)[0]));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void somebody_with_no_membership_is_refused_and_told_why() {
+  var a = CheckIn(Bo);
+  Assert.Equal(AdmissionState.Refused, a.State);
+  Assert.Equal("No membership on record.", a.Reason);
+  Assert.False(EntryFor(Bo).CanEnter);
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void a_day_ticket_lets_you_in_all_day_and_not_tomorrow() {
+  Sold(Bo, "Day ticket");
+  Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State);
+  Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State);         // in and out as often as you like
+  TestClock.Advance(TimeSpan.FromHours(25));
+  var tomorrow = CheckIn(Bo);
+  Assert.Equal(AdmissionState.Refused, tomorrow.State);
+  Assert.True(tomorrow.Reason.StartsWith("Day ticket ran out on "));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void an_unlimited_membership_is_used_before_a_card_and_uses_no_visit() {
+  Sold(Ada, "Ten swims");
+  Sold(Ada, "Monthly");
+  var a = CheckIn(Ada);
+  Assert.True(a.Unlimited);
+  Assert.Equal("Monthly", a.Membership.Plan.Name);
+  Assert.Null(a.Spend);
+  Assert.Equal(10, VisitsLeftOn(MembershipsOf(Ada).Single(m => m.Plan.Name == "Ten swims")));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void a_membership_sold_to_start_later_says_when() {
+  runas(Cass) { SellMembership(Bo, Plan("Monthly"), startsOn: DateTime.UtcNow.AddDays(3)); }
+  var a = CheckIn(Bo);
+  Assert.Equal(AdmissionState.Refused, a.State);
+  Assert.True(a.Reason.StartsWith("Monthly starts on "));
+  TestClock.Advance(TimeSpan.FromDays(4));
+  Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State);
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void the_gate_undoes_a_mistaken_scan_and_the_visit_goes_back() {
+  Sold(Bo, "Ten swims");
+  var a = CheckIn(Bo);
+  Assert.Equal(9, a.VisitsLeft);
+  UndoAdmission(a, "Scanned twice");
+  Assert.Equal(10, VisitsLeftOn(MembershipsOf(Bo)[0]));
+  Assert.NotNull(Admission.Single(x => x.Id == a.Id).UndoneAt);
+  Assert.Throws<ValidationException>(() => UndoAdmission(a));
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_checks_themself_in_at_the_turnstile_but_nobody_else() {
+  Sold(Ada, "Ten swims");
+  Assert.Equal(AdmissionState.Admitted, CheckIn(Ada, "Turnstile").State);
+  Assert.Denied(() => CheckIn(Bo, "Turnstile"));
+}
+
+[Test(Pool)]
+[runas(Lee)]
+void the_door_log_lists_todays_attempts_newest_first() {
+  Sold(Ada, "Monthly");
+  CheckIn(Ada);
+  CheckIn(Bo);
+  var log = AdmissionsToday();
+  Assert.Equal(2, log.Count);
+  Assert.Equal(AdmissionState.Refused, log[0].State);
+  Assert.Equal(1, LockerLoan.Count());              // the pool's own handler gave Ada a locker
+}

@@ -1,0 +1,585 @@
+// The kit's pages, served at its routes in every app that uses it — in the app's own shell and theme:
+//
+//     /memberships                 MyMembershipsPage       what lets the signed-in person in, pausing it, renewing it
+//     /staff/memberships           MembershipsDeskPage     may this person enter? check them in, sell, pause, end, transfer
+//     /staff/memberships/plans     MembershipPlansPage     the plans on sale
+//
+// ⚑ AN APP TAKES ONE OVER by declaring a component of the same name — with a `[Route]` of its own it is served there
+//   instead; without one, the address is not served. The parts (`MyMemberships`, `MembershipsDesk`, `MembershipPlans`,
+//   `MembershipPlanList`) are `[Composable]`, for a page of the app's own. Every colour, face and size is a theme
+//   token, so a look re-skins them.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+using Osysharp.Ui;
+
+// ── the pages ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The signed-in person's memberships.
+[Route("/memberships")] [Layout(WorkspaceFrame)] [Render(CSR)] [Title("Your memberships")]
+public component MyMembershipsPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "960px") {
+      PageHead("Your memberships", subtitle: "What lets you in, until when, and the times you came.");
+      MyMemberships();
+    }
+  }
+}
+
+/// The desk: may this person enter — and checking them in, selling, pausing, ending, transferring.
+[Route("/staff/memberships")] [Layout(WorkspaceFrame)] [Authorize(WorksMemberships)] [Render(CSR)] [Title("Memberships desk")]
+[Nav("Memberships", Order = 55)]
+public component MembershipsDeskPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "1200px") {
+      PageHead("Memberships", subtitle: "Find a person to see whether they may come in, and what they hold.");
+      MembershipsDesk();
+    }
+  }
+}
+
+/// The plans on sale, and adding or changing one.
+[Route("/staff/memberships/plans")] [Layout(WorkspaceFrame)] [Authorize(SellsMemberships)] [Render(CSR)] [Title("Membership plans")]
+public component MembershipPlansPage() {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "1000px") {
+      PageHead("Plans", subtitle: "What is on sale: how long each lasts, how many visits, how many people.");
+      MembershipPlans();
+    }
+  }
+}
+
+// ── what a page reads ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A membership as a page shows it.
+public class MembershipCard {
+  public Guid Id;
+  public string Plan = "";
+  public string Holder = "";
+  public bool Mine;
+  public string Standing = "";
+  public bool Live;
+  public bool Ended;
+  public bool Paused;
+  public bool Unlimited;
+  public int VisitsLeft;
+  public int Visits;
+  public DateTime? ValidUntil;
+  public List<string> People = [];
+  public bool CanPause;
+  public bool Renewable;
+  public bool AutoRenew;
+  public decimal Unused;
+  public string Currency = "";
+}
+
+/// An attempt to enter, as a page lists it.
+public class AdmissionLine {
+  public Guid Id;
+  public DateTime At;
+  public string Person = "";
+  public string Plan = "";
+  public string Place = "";
+  public bool Admitted;
+  public bool Undone;
+  public string Detail = "";
+}
+
+/// One person's memberships and visits, as the caller may see them.
+public class MembershipsView {
+  public Guid Person;
+  public string Name = "";
+  public MembershipEntry Entry = new MembershipEntry();
+  public List<MembershipCard> Cards = [];
+  public List<AdmissionLine> Visits = [];
+}
+
+/// Somebody the desk may look up.
+public class MemberLine {
+  public Guid Id;
+  public string Name = "";
+  public string Email = "";
+}
+
+/// A person's name as a page writes it.
+public string MemberName(Principal p) { return p.DisplayName != null && p.DisplayName != "" ? p.DisplayName : p.Email; }
+
+/// `person`'s memberships and visits — the pages' one read.
+public MembershipsView MembershipsViewOf(Principal person) {
+  var setup = App.Setting<MembershipsSetup>();
+  var view = new MembershipsView { Person = person.Id, Name = MemberName(person), Entry = EntryFor(person) };
+  foreach (var m in MembershipsOf(person)) {
+    var now = DateTime.UtcNow;
+    view.Cards.Add(new MembershipCard {
+      Id = m.Id, Plan = m.Plan.Name, Holder = MemberName(m.Holder), Mine = m.Holder.Id == person.Id, Standing = MembershipStanding(m),
+      Ended = m.EndedAt != null, Paused = m.PausedAt != null,
+      Live = m.EndedAt == null && m.PausedAt == null && (m.ValidUntil == null || m.ValidUntil > now),
+      Unlimited = m.Unlimited, VisitsLeft = VisitsLeftOn(m), Visits = m.Visits, ValidUntil = m.ValidUntil,
+      People = MembersOf(m).Select(p => MemberName(p)).ToList(),
+      CanPause = m.EndedAt == null && m.Plan.MaxPauseDays > m.PausedDays && setup.MembersMayPause,
+      Renewable = m.Plan.Renewable && m.EndedAt == null, AutoRenew = m.AutoRenew, Unused = UnusedValueOf(m), Currency = m.Plan.Currency,
+    });
+  }
+  foreach (var a in AdmissionsOf(person, 20)) { view.Visits.Add(AdmissionLineOf(a)); }
+  return view;
+}
+
+/// An admission as a page lists it.
+public AdmissionLine AdmissionLineOf(Admission a) {
+  return new AdmissionLine {
+    Id = a.Id, At = a.At, Person = MemberName(a.Person), Plan = a.Membership == null ? "" : a.Membership.Plan.Name, Place = a.Place,
+    Admitted = a.State == AdmissionState.Admitted, Undone = a.UndoneAt != null,
+    Detail = a.State == AdmissionState.Refused ? a.Reason : a.Unlimited ? "Unlimited" : a.VisitsLeft == 1 ? "1 visit left" : $"{a.VisitsLeft} visits left",
+  };
+}
+
+/// The signed-in person's memberships.
+public MembershipsView MyMembershipsView() {
+  var me = CurrentPrincipal();
+  return me == null ? new MembershipsView() : MembershipsViewOf(me!);
+}
+
+/// People whose name or address contains `search` — for the desk to choose one (at most 20).
+[Server, Authorize(WorksMemberships)]
+public List<MemberLine> FindMembers(string search) {
+  var q = search.Trim();
+  if (q.Length < 2) { return []; }
+  return Principal.Where(p => p.DisplayName.Contains(q) || p.Email.Contains(q)).OrderBy(p => p.DisplayName).Take(20).ToList()
+    .Select(p => new MemberLine { Id = p.Id, Name = MemberName(p), Email = p.Email }).ToList();
+}
+
+/// Today's door log, as the desk lists it.
+[Server, Authorize(WorksMemberships)]
+public List<AdmissionLine> DoorLog() { return AdmissionsToday(50).Select(a => AdmissionLineOf(a)).ToList(); }
+
+/// The plans on sale, in their order.
+public List<MembershipPlan> PlansOnSale() {
+  return MembershipPlan.Where(p => p.OnSale).OrderBy(p => p.SortOrder).ThenBy(p => p.Name).Take(50).ToList();
+}
+
+/// What a plan is, in a line: "1 month · unlimited", "10 visits within 12 months · from the first visit", "1 year · up to 4 people".
+public string PlanSummary(MembershipPlan p) {
+  var length = $"{p.Periods} {p.Period.Label.ToLower()}{(p.Periods == 1 ? "" : "s")}";
+  var visits = p.Visits == 0 ? length + " · unlimited" : $"{p.Visits} visits within {length}";
+  return visits + (p.StartsOnFirstVisit ? " · from the first visit" : "") + (p.People > 1 ? $" · up to {p.People} people" : "")
+    + (p.MaxPauseDays > 0 ? $" · pause up to {p.MaxPauseDays} days" : "");
+}
+
+/// A price as the pages write it: "45.00 EUR".
+public string PlanPrice(decimal amount, string currency) { return amount.ToString("N2") + (currency != "" ? " " + currency : ""); }
+
+// ── the parts ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The signed-in person's memberships: each with where it stands, pausing and renewing where they may, and their visits.
+/// In a test: `Ui.Click("Pause", within: "Monthly")`.
+[Composable]
+public component MyMemberships() {
+  MembershipsView view = new MembershipsView();
+  string done = "";
+  string problem = "";
+  on mount { view = MyMembershipsView(); }
+  action Reload() { view = MyMembershipsView(); }
+  action Pause(MembershipCard c) {
+    done = ""; problem = "";
+    try { PauseMembership(Membership.Single(m => m.Id == c.Id)); done = $"{c.Plan} is paused. Resume it whenever you like."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Resume(MembershipCard c) {
+    done = ""; problem = "";
+    try { ResumeMembership(Membership.Single(m => m.Id == c.Id)); done = $"{c.Plan} runs again; its end moved by the days it was paused."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Renew(MembershipCard c, bool on) {
+    done = ""; problem = "";
+    try { SetAutoRenew(Membership.Single(m => m.Id == c.Id), on); done = on ? $"{c.Plan} renews by itself." : $"{c.Plan} ends when it runs out."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  render {
+    Stack(gap: 6) {
+      MembershipEntryBanner(view.Entry, "You can come in", "You cannot come in right now");
+      if (done != "") { Alert(done, tone: Tone.Success); }
+      if (problem != "") { Alert(problem, tone: Tone.Danger); }
+      Stack(gap: 3, role: UiRole.List, label: "Memberships") {
+        if (view.Cards.Count == 0) { EmptyState("No membership yet", body: "Memberships you buy, or that you are added to, appear here."); }
+        foreach (var c in view.Cards) {
+          MembershipCardView(c) {
+            if (c.Mine && c.CanPause && !c.Paused && c.Live) { Button("Pause", onPress: () => Pause(c), size: Size.Sm); }
+            if (c.Mine && c.Paused) { Button("Resume", onPress: () => Resume(c), size: Size.Sm, tone: Tone.Primary); }
+            if (c.Mine && c.Renewable && !c.AutoRenew) { Button("Renew automatically", onPress: () => Renew(c, true), size: Size.Sm, tone: Tone.Ghost); }
+            if (c.Mine && c.Renewable && c.AutoRenew) { Button("Stop renewing", onPress: () => Renew(c, false), size: Size.Sm, tone: Tone.Ghost); }
+          }
+        }
+      }
+      AdmissionList(view.Visits, "Your visits", false, null);
+    }
+  }
+}
+
+/// Whether a person may enter — the answer in a word, and the sentence when they may not.
+[Composable]
+public component MembershipEntryBanner(MembershipEntry entry, string yes, string no) {
+  render {
+    Row(gap: 4, align: Align.Center, p: 5, rounded: Radius.Lg, borderW: 1, label: entry.CanEnter ? yes : no,
+        border: entry.CanEnter ? Colors.Success : Colors.Border, bg: entry.CanEnter ? Colors.Success.Subtle : Colors.Surface) {
+      Lamp(lit: entry.CanEnter, tone: entry.CanEnter ? Tone.Success : Tone.Danger);
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Text(entry.CanEnter ? yes : no, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold);
+        Text(entry.CanEnter
+               ? entry.Plan + (entry.Unlimited ? "" : entry.VisitsLeft == 1 ? " · 1 visit left" : $" · {entry.VisitsLeft} visits left")
+                 + (entry.ValidUntil != null ? " · until " + entry.ValidUntil.Value.ToString("d MMM yyyy") : "")
+               : entry.Reason,
+             color: Colors.TextSecondary);
+      }
+    }
+  }
+}
+
+/// One membership as a card — its plan, where it stands, what is left, who else it lets in — with the actions passed in.
+[Composable, Part]
+public component MembershipCardView(MembershipCard c) {
+  render {
+    Stack(gap: 3, p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, role: UiRole.ListItem, label: c.Plan) {
+      Row(gap: 3, align: Align.Start, wrap: Wrapping.Wrap) {
+        Stack(gap: 1, grow: 1, minW: "0") {
+          Text(c.Plan, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, color: c.Ended ? Colors.TextMuted : Colors.OnSurface);
+          Text(c.Mine ? c.Standing : c.Standing + " · held by " + c.Holder, color: Colors.TextMuted, fontSize: FontSize.Caption);
+        }
+        Badge(c.Ended ? "Ended" : c.Paused ? "Paused" : c.Live ? "Active" : "Not started", tone: c.Live ? Tone.Success : c.Paused ? Tone.Warning : Tone.Ghost);
+      }
+      Row(gap: 6, wrap: Wrapping.Wrap) {
+        Metric(c.Unlimited ? "visits" : "visits left", text: c.Unlimited ? "Unlimited" : $"{c.VisitsLeft} of {c.Visits}");
+        if (c.ValidUntil != null) { Metric(c.Ended ? "ended" : "until", text: c.ValidUntil.Value.ToString("d MMM yyyy")); }
+        if (c.AutoRenew) { Metric("renews", text: "Automatically"); }
+      }
+      if (c.People.Count > 0) { Text("Also for " + string.Join(", ", c.People), fontSize: FontSize.Caption, color: Colors.TextSecondary); }
+      Row(gap: 2, wrap: Wrapping.Wrap) { Slot; }
+    }
+  }
+}
+
+/// A list of attempts to enter — the person's visits, or the desk's door log.
+[Composable]
+public component AdmissionList(List<AdmissionLine> lines, string title, bool showPerson, Action<AdmissionLine>? onUndo) {
+  render {
+    Stack(gap: 2) {
+      SectionLabel(title);
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+            role: UiRole.List, label: title) {
+        if (lines.Count == 0) { Box(p: 5) { EmptyState("Nobody yet", body: "Each time somebody comes in, or is turned away, it is listed here."); } }
+        foreach (var l in lines) {
+          Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+              label: showPerson ? l.Person : l.At.ToString("d MMM HH:mm")) {
+            Text(l.At.ToString(showPerson ? "HH:mm" : "d MMM HH:mm"), fontFamily: Font.Mono, fontSize: FontSize.Caption, color: Colors.TextMuted,
+                 w: showPerson ? "56px" : "120px", shrink: 0, whiteSpace: WhiteSpace.Nowrap);
+            Lamp(lit: l.Admitted && !l.Undone, tone: l.Admitted ? Tone.Success : Tone.Danger);
+            Stack(gap: 0, grow: 1, minW: "0") {
+              Text(showPerson ? l.Person : (l.Plan != "" ? l.Plan : "No membership"), fontWeight: FontWeight.Medium);
+              Text((l.Undone ? "Undone · " : "") + l.Detail + (l.Place != "" ? " · " + l.Place : ""), fontSize: FontSize.Caption,
+                   color: l.Admitted ? Colors.TextMuted : Colors.Danger);
+            }
+            if (onUndo != null && l.Admitted && !l.Undone) {
+              Button("Undo", onPress: () => onUndo!(l), size: Size.Sm, tone: Tone.Ghost);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The desk: find a person, see at once whether they may enter, check them in — and sell, pause, resume, end, renew or
+/// transfer their memberships. A control the caller may not use is refused by the kit's rules, with the reason. In a
+/// test: `Ui.Fill("Find a person", "ada"); Ui.Click("Find"); Ui.Click("Ada Moreno"); Ui.Click("Check in")`.
+[Composable]
+[Authorize(WorksMemberships)]
+public component MembershipsDesk() {
+  string search = "";
+  List<MemberLine> found = [];
+  Guid open = Guid.Empty;
+  MembershipsView view = new MembershipsView();
+  List<AdmissionLine> log = [];
+  List<MembershipPlan> plans = [];
+  string done = "";
+  string problem = "";
+  string place = "";
+  // selling
+  bool selling = false;
+  MembershipPlan? plan = null;
+  DateOnly? startsOn = null;
+  bool autoRenew = false;
+  // a membership being changed: "pause", "extend", "end", "transfer"
+  string changing = "";
+  Guid changingId = Guid.Empty;
+  string changingPlan = "";
+  DateOnly? until = null;
+  string why = "";
+  string to = "";
+
+  on mount { log = DoorLog(); }
+
+  action Find() { found = FindMembers(search); }
+  action Open(Guid id) { open = id; done = ""; problem = ""; Reload(); }
+  action Reload() { view = MembershipsViewOf(Principal.Single(p => p.Id == open)); log = DoorLog(); }
+  action Admit() {
+    done = ""; problem = "";
+    try {
+      var a = CheckIn(Principal.Single(p => p.Id == open), place);
+      if (a.State == AdmissionState.Admitted) { done = $"{view.Name} is checked in."; } else { problem = a.Reason; }
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Undo(AdmissionLine l) {
+    done = ""; problem = "";
+    try { UndoAdmission(Admission.Single(a => a.Id == l.Id), "Undone at the desk"); done = "The visit went back."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action StartSelling() { plans = PlansOnSale(); plan = null; startsOn = null; autoRenew = false; selling = true; problem = ""; }
+  action StopSelling() { selling = false; }
+  action Sell() {
+    problem = "";
+    try {
+      if (plan == null) { problem = "Choose a plan."; return; }
+      SellMembership(Principal.Single(p => p.Id == open), plan!, null,
+                     startsOn == null ? null : startsOn!.Value.ToDateTime(new TimeOnly(0, 0)), autoRenew);
+      done = $"{view.Name} has {plan!.Name}."; selling = false;
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Ask(string what, MembershipCard c) { changing = what; changingId = c.Id; changingPlan = c.Plan; until = null; why = ""; to = ""; problem = ""; }
+  action StopAsking() { changing = ""; }
+  action Resume(MembershipCard c) {
+    done = ""; problem = "";
+    try { ResumeMembership(Membership.Single(m => m.Id == c.Id), "At the desk"); done = $"{c.Plan} runs again."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Renew(MembershipCard c) {
+    done = ""; problem = "";
+    try { var next = RenewMembership(Membership.Single(m => m.Id == c.Id)); done = $"{c.Plan} renewed — the next one starts {next.ValidFrom.Value.ToString("d MMM yyyy")}."; Reload(); }
+    catch (Exception ex) { problem = ex.Message; }
+  }
+  action Change() {
+    problem = "";
+    try {
+      var m = Membership.Single(x => x.Id == changingId);
+      DateTime? day = until == null ? null : until!.Value.ToDateTime(new TimeOnly(0, 0));
+      if (changing == "pause") { PauseMembership(m, day, why); done = $"{changingPlan} is paused."; }
+      if (changing == "extend") {
+        if (day == null) { problem = "Choose the new end."; return; }
+        ExtendMembership(m, day!.Value, why); done = $"{changingPlan} now runs until {until!.Value.ToString("d MMM yyyy")}.";
+      }
+      if (changing == "end") { EndMembership(m, why); done = $"{changingPlan} has ended."; }
+      if (changing == "transfer") {
+        var who = FindMembers(to).FirstOrDefault();
+        if (who == null) { problem = "Nobody's name or address matches that."; return; }
+        TransferMembership(m, Principal.Single(p => p.Id == who.Id), why); done = $"{changingPlan} is {who.Name}'s now.";
+      }
+      changing = "";
+      Reload();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Row(gap: 5, align: Align.Start, wrap: Wrapping.Wrap, w: "100%") {
+      Stack(gap: 3, w: Layout.AtLeast(Laptop) ? "300px" : "100%", shrink: 0) {
+        Row(gap: 2, align: Align.Center) {
+          Box(grow: 1, minW: "0") { SearchField("Find a person", value: search) { } }
+          Button("Find", onPress: Find, size: Size.Sm);
+        }
+        Stack(gap: 0, role: UiRole.List, label: "People found") {
+          foreach (var h in found) {
+            Pressable(onClick: () => Open(h.Id), label: h.Name, role: UiRole.ListItem, current: h.Id == open) {
+              Stack(gap: 0, px: 3, py: 2, borderBW: 1, border: Colors.Border, bg: h.Id == open ? Colors.Primary.Subtle : Colors.Surface) {
+                Text(h.Name, fontWeight: FontWeight.Medium);
+                Text(h.Email, fontSize: FontSize.Caption, color: Colors.TextMuted);
+              }
+            }
+          }
+        }
+        AdmissionList(log, "Today at the door", true, Undo);
+      }
+      Stack(gap: 5, grow: 1, minW: "0", w: Layout.AtLeast(Laptop) ? "auto" : "100%") {
+        if (open == Guid.Empty) {
+          EmptyState("Choose a person", body: "Find them by name or address to see whether they may come in.");
+        } else {
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(view.Name, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, grow: 1);
+            Button("Sell a membership", onPress: StartSelling, size: Size.Sm);
+          }
+          MembershipEntryBanner(view.Entry, "May come in", "May not come in");
+          Row(gap: 3, align: Align.End, wrap: Wrapping.Wrap) {
+            Box(w: "220px") { Field("Where", value: place, placeholder: "Main entrance"); }
+            Button("Check in", onPress: Admit, tone: Tone.Primary);
+          }
+          if (done != "") { Alert(done, tone: Tone.Success); }
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Stack(gap: 3, role: UiRole.List, label: "Memberships") {
+            if (view.Cards.Count == 0) { EmptyState("No membership", body: "Sell one to let them in."); }
+            foreach (var c in view.Cards) {
+              MembershipCardView(c) {
+                if (!c.Ended && !c.Paused) { Button("Pause", onPress: () => Ask("pause", c), size: Size.Sm, tone: Tone.Ghost); }
+                if (c.Paused) { Button("Resume", onPress: () => Resume(c), size: Size.Sm, tone: Tone.Ghost); }
+                if (!c.Ended && c.ValidUntil != null) { Button("Change end", onPress: () => Ask("extend", c), size: Size.Sm, tone: Tone.Ghost); }
+                if (!c.Ended) { Button("Renew", onPress: () => Renew(c), size: Size.Sm, tone: Tone.Ghost); }
+                if (!c.Ended && c.Mine) { Button("Transfer", onPress: () => Ask("transfer", c), size: Size.Sm, tone: Tone.Ghost); }
+                if (!c.Ended) { Button("End", onPress: () => Ask("end", c), size: Size.Sm, tone: Tone.Danger); }
+                if (!c.Ended && c.Unused > 0m) { Text("Unused: " + PlanPrice(c.Unused, c.Currency), fontSize: FontSize.Caption, color: Colors.TextMuted, alignSelf: AlignSelf.Center); }
+              }
+            }
+          }
+          AdmissionList(view.Visits, "Their visits", false, null);
+        }
+      }
+    }
+    if (selling) {
+      Dialog("Sell " + view.Name + " a membership", onDismiss: StopSelling, subtitle: "It starts today unless you choose a day — or, for a plan that does, on the first visit.") {
+        Dropdown("Plan", value: plan, options: plans, placeholder: "Choose") { p => Text(p.Name + " — " + PlanPrice(p.Price, p.Currency)); }
+        if (plan != null) { Text(PlanSummary(plan!), fontSize: FontSize.Caption, color: Colors.TextMuted); }
+        Box(w: "220px") { DatePicker("Starts", value: startsOn, clearable: true, placeholder: "Today"); }
+        if (plan != null && plan!.Renewable) { Checkbox("Renews automatically", value: autoRenew); }
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopSelling, tone: Tone.Ghost);
+          Button("Sell it", onPress: Sell, tone: Tone.Primary);
+        }
+      }
+    }
+    if (changing != "") {
+      Dialog(changing == "pause" ? "Pause " + changingPlan : changing == "extend" ? "Change when " + changingPlan + " ends"
+             : changing == "transfer" ? "Transfer " + changingPlan : "End " + changingPlan + "?",
+             onDismiss: StopAsking,
+             subtitle: changing == "end" ? "It lets nobody in from now on, and any visits left on it are void. Say why — it is kept."
+               : changing == "transfer" ? "It ends for its holder and goes on — the same end, the visits left — for the person you name."
+               : "The change is kept with who made it and why.") {
+        if (changing == "pause") { Box(w: "220px") { DatePicker("Until", value: until, clearable: true, placeholder: "As long as allowed"); } }
+        if (changing == "extend") { Box(w: "220px") { DatePicker("Ends on", value: until); } }
+        if (changing == "transfer") { Field("To whom — a name or an address", value: to); }
+        Field("Why (kept with the change)", value: why);
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: StopAsking, tone: Tone.Ghost);
+          Button(changing == "pause" ? "Pause it" : changing == "extend" ? "Change it" : changing == "transfer" ? "Transfer it" : "End it",
+                 onPress: Change, tone: changing == "end" ? Tone.Danger : Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// The plans on sale — the price list, for a page that sells them. `onChoose` is what the page does with one.
+[Composable]
+public component MembershipPlanList(Action<MembershipPlan> onChoose, string choose = "Choose") {
+  List<MembershipPlan> plans = [];
+  on mount { plans = PlansOnSale(); }
+  render {
+    Box(display: Display.Grid, cols: "repeat(auto-fill, minmax(220px, 1fr))", gap: 4, role: UiRole.List, label: "Plans") {
+      foreach (var p in plans) {
+        Stack(gap: 3, p: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, role: UiRole.ListItem, label: p.Name) {
+          Text(p.Name, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold);
+          Text(PlanPrice(p.Price, p.Currency), fontSize: FontSize.Title, fontWeight: FontWeight.Bold);
+          Text(PlanSummary(p), fontSize: FontSize.Caption, color: Colors.TextMuted);
+          if (p.Description != "") { Text(p.Description, color: Colors.TextSecondary); }
+          Spacer();
+          Button(choose, onPress: () => onChoose(p), tone: Tone.Primary);
+        }
+      }
+    }
+  }
+}
+
+/// The plans, and adding or changing one. In a test: `Ui.Click("Add a plan"); Ui.Fill("Name", "Weekend pass")`.
+[Composable]
+[Authorize(SellsMemberships)]
+public component MembershipPlans() {
+  List<MembershipPlan> plans = [];
+  bool editing = false;
+  Guid editingId = Guid.Empty;
+  string name = "";
+  string description = "";
+  decimal price = 0m;
+  string currency = "";
+  int periods = 1;
+  PlanPeriod period = PlanPeriod.Month;
+  int visits = 0;
+  bool firstVisit = false;
+  int maxPause = 0;
+  int people = 1;
+  bool renewable = false;
+  bool onSale = true;
+  string problem = "";
+  string done = "";
+
+  on mount { Load(); }
+  action Load() { plans = MembershipPlan.OrderBy(p => p.SortOrder).ThenBy(p => p.Name).Take(100).ToList(); }
+  action StartNew() {
+    editingId = Guid.Empty; name = ""; description = ""; price = 0m; currency = plans.Select(p => p.Currency).FirstOrDefault() ?? "";
+    periods = 1; period = PlanPeriod.Month; visits = 0; firstVisit = false; maxPause = 0; people = 1; renewable = false; onSale = true;
+    problem = ""; editing = true;
+  }
+  action Edit(MembershipPlan p) {
+    editingId = p.Id; name = p.Name; description = p.Description; price = p.Price; currency = p.Currency; periods = p.Periods;
+    period = p.Period; visits = p.Visits; firstVisit = p.StartsOnFirstVisit; maxPause = p.MaxPauseDays; people = p.People;
+    renewable = p.Renewable; onSale = p.OnSale; problem = ""; editing = true;
+  }
+  action Stop() { editing = false; }
+  action Save() {
+    problem = "";
+    try {
+      var p = editingId == Guid.Empty ? new MembershipPlan { Name = name.Trim(), SortOrder = plans.Count + 1 } : MembershipPlan.Single(x => x.Id == editingId);
+      p.Name = name.Trim(); p.Description = description.Trim(); p.Price = price; p.Currency = currency.Trim().ToUpper();
+      p.Periods = periods; p.Period = period; p.Visits = visits; p.StartsOnFirstVisit = firstVisit; p.MaxPauseDays = maxPause;
+      p.People = people; p.Renewable = renewable; p.OnSale = onSale;
+      UnitOfWork.Commit();
+      done = $"{p.Name} is saved."; editing = false;
+      Load();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 4) {
+      Row(gap: 2, justify: Justify.End) { Button("Add a plan", onPress: StartNew, tone: Tone.Primary, size: Size.Sm); }
+      if (done != "") { Alert(done, tone: Tone.Success); }
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
+            role: UiRole.List, label: "Plans") {
+        if (plans.Count == 0) { Box(p: 5) { EmptyState("No plans yet", body: "Add the first thing you sell — a day ticket, a monthly membership, a card of visits."); } }
+        foreach (var p in plans) {
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: p.Name) {
+            Stack(gap: 0, grow: 1, minW: "0") {
+              Text(p.Name, fontWeight: FontWeight.Medium, color: p.OnSale ? Colors.OnSurface : Colors.TextMuted);
+              Text(PlanSummary(p), fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+            if (!p.OnSale) { Badge("Not on sale", tone: Tone.Ghost); }
+            Text(PlanPrice(p.Price, p.Currency), fontVariant: FontVariant.TabularNums, w: "120px", textAlign: TextAlign.Right);
+            Button("Edit", onPress: () => Edit(p), size: Size.Sm, tone: Tone.Ghost);
+          }
+        }
+      }
+    }
+    if (editing) {
+      Dialog(editingId == Guid.Empty ? "Add a plan" : "Change " + name, onDismiss: Stop, subtitle: "A membership already sold keeps what it was sold with.") {
+        Field("Name", value: name, placeholder: "Monthly");
+        TextAreaField("What it is", value: description, rows: 2);
+        Row(gap: 3, wrap: Wrapping.Wrap) {
+          Box(w: "140px") { DecimalField("Price", value: price, min: 0m); }
+          Box(w: "100px") { Field("Currency", value: currency, placeholder: "EUR"); }
+          Box(w: "100px") { NumberField("Lasts", value: periods, min: 1); }
+          Box(w: "140px") { Dropdown("Counted in", value: period); }
+        }
+        Row(gap: 3, wrap: Wrapping.Wrap) {
+          Box(w: "140px") { NumberField("Visits (0: unlimited)", value: visits, min: 0); }
+          Box(w: "140px") { NumberField("People", value: people, min: 1); }
+          Box(w: "160px") { NumberField("Pause up to (days)", value: maxPause, min: 0); }
+        }
+        Checkbox("Starts on the first visit", value: firstVisit);
+        Checkbox("Can renew automatically", value: renewable);
+        Checkbox("On sale", value: onSale);
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, justify: Justify.End) {
+          Button("Cancel", onPress: Stop, tone: Tone.Ghost);
+          Button("Save", onPress: Save, tone: Tone.Primary);
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,180 @@
+// Selling and renewing a membership, and what anybody may read about one: whether a person may enter now (and the
+// sentence that says why not), what is left of it, and what that is worth in money.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+
+// ── selling ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// When a membership of `plan` that starts at `from` ends.
+public DateTime MembershipEndFrom(MembershipPlan plan, DateTime from) {
+  if (plan.Period == PlanPeriod.Year) { return from.AddYears(plan.Periods); }
+  if (plan.Period == PlanPeriod.Month) { return from.AddMonths(plan.Periods); }
+  if (plan.Period == PlanPeriod.Week) { return from.AddDays(7 * plan.Periods); }
+  return from.AddDays(plan.Periods);
+}
+
+/// Sell `holder` a membership of `plan`, starting `startsOn` (now, unless given — or on the first visit, for a plan that
+/// starts then), at `price` (the plan's, unless given). Idempotent per `reference`: the same reference answers the
+/// membership it already sold. A counted plan's visits arrive as a pack of credits in the same commit. Throws the
+/// sentence to show for a plan that is not on sale.
+[Server, Authorize(SellsMemberships)]
+public Membership SellMembership(Principal holder, MembershipPlan plan, string? reference = null, DateTime? startsOn = null,
+                                 bool autoRenew = false, decimal? price = null, Membership? renewalOf = null) {
+  if (reference != null) {
+    var existing = Membership.FirstOrDefault(m => m.Reference == reference);
+    if (existing != null) { return existing; }
+  }
+  var fresh = MembershipPlan.Single(p => p.Id == plan.Id);
+  if (!fresh.OnSale && renewalOf == null) { throw new ValidationException($"{fresh.Name} is not on sale."); }
+  DateTime? from = startsOn;
+  if (from == null && !fresh.StartsOnFirstVisit) { from = DateTime.UtcNow; }
+  var m = new Membership {
+    Holder = holder, Plan = fresh, ValidFrom = from, ValidUntil = from == null ? null : MembershipEndFrom(fresh, from.Value),
+    Unlimited = fresh.Visits == 0, Visits = fresh.Visits, Price = price ?? fresh.Price, Reference = reference,
+    SoldBy = CurrentPrincipal(), AutoRenew = autoRenew && fresh.Renewable, RenewalOf = renewalOf,
+  };
+  UnitOfWork.Commit();
+  Raise(new MembershipSold { Membership = m });
+  return m;
+}
+
+/// Renew `membership`: the next one of the same plan, starting when it ends (or now, when it has ended), at the plan's
+/// price today. Idempotent: renewing the same membership twice answers the one renewal. The app calls it when it has
+/// been paid — from `MembershipRenewalDue`, a checkout, the desk.
+[Server, Authorize(SellsMemberships)]
+public Membership RenewMembership(Membership membership, string? reference = null) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  var now = DateTime.UtcNow;
+  DateTime? from = m.EndedAt == null && m.ValidUntil != null && m.ValidUntil > now ? m.ValidUntil : now;
+  var next = SellMembership(m.Holder, m.Plan, reference ?? ("renewal:" + m.Id), from, m.AutoRenew, null, m);
+  Raise(new MembershipRenewed { From = m, Next = next });
+  return next;
+}
+
+/// Turn renewing by itself on or off for `membership` — its holder (or whoever acts for them), or the desk.
+[Server, Authorize(IsAuthenticated)]
+public void SetAutoRenew(Membership membership, bool on) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  if (!SellsMemberships && !ActsForMember(m.Holder)) { throw new NotAuthorized("Only its holder or the desk can change that."); }
+  if (on && !m.Plan.Renewable) { throw new ValidationException($"{m.Plan.Name} does not renew by itself."); }
+  m.AutoRenew = on;
+  UnitOfWork.Commit();
+}
+
+// ── reading ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The scope a counted membership's visits are kept in, in Osysharp.PrepaidCredits.
+public string MembershipScope(Membership m) { return m.Credits == null ? "membership:" + m.Id : m.Credits.Scope; }
+
+/// Visits left on a counted membership (0 for an unlimited one).
+public int VisitsLeftOn(Membership m) {
+  if (m.Unlimited || m.Credits == null) { return 0; }
+  return CreditsLeft(m.Holder, m.Credits.Scope);
+}
+
+/// Every membership `person` holds or shares, that the caller may see (at most 50) — newest first.
+public List<Membership> MembershipsOf(Principal person) {
+  var shared = MembershipMember.Where(x => x.Member == person).Select(x => x.Membership.Id).Take(50).ToList();
+  return Membership.Include(m => m.Plan).Include(m => m.Credits).Include(m => m.Holder)
+    .Where(m => m.Holder == person || shared.Contains(m.Id))
+    .OrderByDescending(m => m.SoldAt).Take(50).ToList();
+}
+
+/// The people `membership` lets in besides its holder.
+public List<Principal> MembersOf(Membership membership) {
+  return MembershipMember.Where(x => x.Membership == membership).OrderBy(x => x.AddedAt).Take(20).Select(x => x.Member).ToList();
+}
+
+/// Whether somebody may enter now, on which membership, and — when they may not — the sentence that says why.
+public class MembershipEntry {
+  public bool CanEnter;
+  public Guid? Membership;
+  public string Plan = "";
+  public bool Unlimited;
+  public int VisitsLeft;
+  public DateTime? ValidUntil;
+  public string Reason = "";
+}
+
+/// May `person` enter now — read only, nothing is used. The best membership first: an unlimited one before a counted
+/// one, and among the rest the one that ends first. When none lets them in, the reason is about the one that comes
+/// closest: paused, not started yet, no visits left, ended.
+public MembershipEntry EntryFor(Principal person) {
+  var now = DateTime.UtcNow;
+  var all = MembershipsOf(person);
+  var mine = all.Where(m => m.EndedAt == null).ToList();
+  if (mine.Count == 0) {
+    var last = all.FirstOrDefault();
+    if (last == null) { return new MembershipEntry { Reason = "No membership on record." }; }
+    return new MembershipEntry { Membership = last.Id, Plan = last.Plan.Name, ValidUntil = last.ValidUntil,
+                                 Reason = EndedSentence(last) };
+  }
+  MembershipEntry? best = null;
+  foreach (var m in mine.OrderByDescending(x => x.Unlimited).ThenBy(x => x.ValidUntil == null).ThenBy(x => x.ValidUntil).ToList()) {
+    var started = m.ValidFrom == null ? m.Plan.StartsOnFirstVisit : m.ValidFrom <= now;
+    var current = started && m.PausedAt == null && (m.ValidUntil == null || m.ValidUntil > now);
+    var left = VisitsLeftOn(m);
+    if (current && (m.Unlimited || left > 0)) {
+      return new MembershipEntry { CanEnter = true, Membership = m.Id, Plan = m.Plan.Name, Unlimited = m.Unlimited,
+                                   VisitsLeft = left, ValidUntil = m.ValidUntil };
+    }
+    if (best == null) {
+      var why = m.PausedAt != null ? $"{m.Plan.Name} is paused until {m.ResumesOn.Value.ToString("d MMMM yyyy")}."
+              : !started ? $"{m.Plan.Name} starts on {m.ValidFrom.Value.ToString("d MMMM yyyy")}."
+              : m.ValidUntil != null && m.ValidUntil <= now ? $"{m.Plan.Name} ran out on {m.ValidUntil.Value.ToString("d MMMM yyyy")}."
+              : $"{m.Plan.Name} has no visits left.";
+      best = new MembershipEntry { Membership = m.Id, Plan = m.Plan.Name, ValidUntil = m.ValidUntil, Reason = why };
+    }
+  }
+  return best!;
+}
+
+/// Why an ended membership lets nobody in.
+public string EndedSentence(Membership m) {
+  if (m.EndedBecause != "" && m.EndedBecause != "Ran out") { return $"{m.Plan.Name} has ended — {m.EndedBecause}."; }
+  return m.ValidUntil == null ? $"{m.Plan.Name} has ended." : $"{m.Plan.Name} ran out on {m.ValidUntil.Value.ToString("d MMMM yyyy")}.";
+}
+
+/// Where a membership stands, in a few words: "Until 3 Nov 2026", "Starts on the first visit", "Paused until 12 Nov",
+/// "Starts 1 Dec", "Ended".
+public string MembershipStanding(Membership m) {
+  var now = DateTime.UtcNow;
+  if (m.EndedAt != null) { return m.EndedBecause == "" ? "Ended" : "Ended — " + m.EndedBecause; }
+  if (m.PausedAt != null) { return "Paused until " + m.ResumesOn.Value.ToString("d MMM"); }
+  if (m.ValidFrom == null) { return "Starts on the first visit"; }
+  if (m.ValidFrom > now) { return "Starts " + m.ValidFrom.Value.ToString("d MMM yyyy"); }
+  if (m.ValidUntil != null && m.ValidUntil <= now) { return "Ran out"; }
+  return "Until " + m.ValidUntil.Value.ToString("d MMM yyyy");
+}
+
+/// What is left of `membership` in money, at what was paid: the share of its visits not used, or of its days not yet
+/// run (days it was paused do not count as used). 0 once it has ended. What a refund or a pro-rated change is made from.
+public decimal UnusedValueOf(Membership membership) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  if (m.EndedAt != null || m.Price == 0) { return 0m; }
+  if (!m.Unlimited) {
+    if (m.Visits == 0) { return 0m; }
+    return Math.Round(m.Price * VisitsLeftOn(m) / m.Visits, 2);
+  }
+  if (m.ValidFrom == null || m.ValidUntil == null) { return m.Price; }
+  var now = DateTime.UtcNow;
+  var total = (m.ValidUntil.Value - m.ValidFrom.Value).TotalDays - m.PausedDays;
+  if (total <= 0) { return 0m; }
+  var from = m.PausedAt != null ? m.PausedAt.Value : now;
+  var left = from <= m.ValidFrom.Value ? total : (m.ValidUntil.Value - from).TotalDays;
+  if (left <= 0) { return 0m; }
+  return Math.Round(m.Price * Convert.ToDecimal(left / total), 2);
+}
+
+/// The admissions of `person` (at most `take`), newest first — what they used and when.
+public List<Admission> AdmissionsOf(Principal person, int take = 50) {
+  return Admission.Include(a => a.Membership.Plan).Where(a => a.Person == person).OrderByDescending(a => a.At).Take(take).ToList();
+}
+
+/// Every change made to `membership`, newest first.
+public List<MembershipChange> ChangesTo(Membership membership) {
+  return MembershipChange.Include(c => c.By).Where(c => c.Membership == membership).OrderByDescending(c => c.At).Take(100).ToList();
+}

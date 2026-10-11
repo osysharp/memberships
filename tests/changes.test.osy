@@ -1,0 +1,251 @@
+// Pausing, resuming, a new end date, ending, transferring, renewing — each a record with who and why — and the clock
+// that tells a holder before the end and ends a membership when its time is up.
+
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+// ── pause and resume ────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_pauses_their_monthly_and_its_end_moves_by_the_days_it_was_paused() {
+  var m = Sold(Ada, "Monthly");
+  var end = m.ValidUntil.Value;
+  PauseMembership(m, DateTime.UtcNow.AddDays(14), "Broken arm");
+  var paused = CheckInAsTheGate(Ada);
+  Assert.Equal(AdmissionState.Refused, paused.State);
+  Assert.True(paused.Reason.StartsWith("Monthly is paused until "));
+  TestClock.Advance(TimeSpan.FromDays(6));
+  ResumeMembership(m, "Back early");
+  var resumed = Membership.Single(x => x.Id == m.Id);
+  Assert.Equal(end.AddDays(6), resumed.ValidUntil.Value);
+  Assert.Equal(6, resumed.PausedDays);
+  Assert.Equal(AdmissionState.Admitted, CheckInAsTheGate(Ada).State);
+  var trail = ChangesTo(m);
+  Assert.Equal(MembershipChangeKind.Resume, trail[0].Kind);
+  Assert.Equal("Broken arm", trail[1].Reason);
+  Assert.Equal(Ada.Id, trail[1].By.Id);
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_pause_ends_by_itself_on_its_day() {
+  var m = Sold(Ada, "Monthly");
+  var end = m.ValidUntil.Value;
+  PauseMembership(m, DateTime.UtcNow.AddDays(10));
+  Workflow.Settle(m);
+  TestClock.Advance(TimeSpan.FromMinutes(10 * 24 * 60 + 1));
+  Workflow.Settle(m);
+  var resumed = Membership.Single(x => x.Id == m.Id);
+  Assert.Null(resumed.PausedAt);
+  Assert.Equal(end.AddDays(10), resumed.ValidUntil.Value);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "resumed" && h.Detail == "Monthly:10"));
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_pause_is_held_to_what_the_plan_allows() {
+  var month = Sold(Ada, "Monthly");
+  Assert.Equal("Monthly may be paused for 30 more days — until " + DateTime.UtcNow.AddDays(30).ToString("d MMMM yyyy") + " at most.",
+               Assert.Throws<ValidationException>(() => PauseMembership(month, DateTime.UtcNow.AddDays(45))).Message);
+  var day = Sold(Ada, "Day ticket");
+  Assert.Equal("Day ticket cannot be paused.", Assert.Throws<ValidationException>(() => PauseMembership(day)).Message);
+}
+
+[Test(Pool)]
+[runas(Bo)]
+void a_swimmer_cannot_pause_somebody_elses_membership() {
+  var m = Sold(Ada, "Monthly");
+  Assert.Throws(() => PauseMembership(m));
+}
+
+// ── the desk's changes ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Pool)]
+[runas(Cass)]
+void the_cashier_moves_an_end_date_with_a_reason_and_the_desk_cannot_without_one() {
+  var m = SellMembership(Ada, Plan("Monthly"));
+  var later = DateTime.UtcNow.AddDays(60);
+  Assert.Throws<ValidationException>(() => ExtendMembership(m, later, " "));
+  ExtendMembership(m, later, "Pool closed for repairs in March");
+  Assert.Equal(later, Membership.Single(x => x.Id == m.Id).ValidUntil.Value);
+  Assert.Equal("Pool closed for repairs in March", ChangesTo(m)[0].Reason);
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void ending_a_card_voids_its_visits_and_says_what_it_was_worth_first() {
+  var m = SellMembership(Bo, Plan("Ten swims"));
+  runas(Lee) { CheckIn(Bo); CheckIn(Bo); CheckIn(Bo); CheckIn(Bo); }
+  Assert.Equal(30m, UnusedValueOf(m));               // 6 of 10 swims left, of 50
+  EndMembership(m, "Moved away — refunded 30 in cash");
+  var ended = Membership.Include(x => x.Credits).Single(x => x.Id == m.Id);
+  Assert.NotNull(ended.EndedAt);
+  Assert.True(ended.Credits.Voided);
+  Assert.Equal(0m, UnusedValueOf(m));
+  runas(Lee) {
+    var a = CheckIn(Bo);
+    Assert.Equal("Ten swims has ended — Moved away — refunded 30 in cash.", a.Reason);
+  }
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_monthly_is_worth_the_days_it_has_left() {
+  var m = SellMembership(Ada, Plan("Monthly"));
+  var total = (m.ValidUntil.Value - m.ValidFrom.Value).TotalDays;
+  TestClock.Advance(TimeSpan.FromDays(10));
+  var expected = Math.Round(45m * Convert.ToDecimal((total - 10) / total), 2);
+  Assert.Equal(expected, UnusedValueOf(m));
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_card_is_transferred_with_the_visits_left_and_the_same_end() {
+  var m = SellMembership(Ada, Plan("Ten swims"));
+  runas(Lee) { CheckIn(Ada); CheckIn(Ada); }
+  var change = TransferMembership(m, Bo, "A gift to her brother");
+  var theirs = Membership.Include(x => x.Credits).Single(x => x.Id == change.Made.Id);
+  Assert.Equal(Bo.Id, theirs.Holder.Id);
+  Assert.Equal(8, VisitsLeftOn(theirs));
+  Assert.Equal(Membership.Single(x => x.Id == m.Id).ValidUntil, theirs.ValidUntil);
+  Assert.Equal(m.Id, theirs.TransferredFrom.Id);
+  runas(Lee) {
+    Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State);
+    Assert.Equal(AdmissionState.Refused, CheckIn(Ada).State);
+  }
+  Assert.Equal(CreditEntryKind.TransferredIn, CreditStatementOf(Bo).Last().Kind);
+  Assert.Equal(1, CreditPacksOf(Bo).Count);
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_may_not_transfer_their_own_unless_the_pool_allows_it() {
+  var m = Sold(Ada, "Monthly");
+  Assert.Denied(() => TransferMembership(m, Bo));
+}
+
+// ── renewal and the end ─────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Pool)]
+[runas(Cass)]
+void a_renewal_starts_when_the_old_one_ends_and_is_made_once() {
+  var m = SellMembership(Ada, Plan("Monthly"));
+  var next = RenewMembership(m);
+  var again = RenewMembership(m);
+  Assert.Equal(next.Id, again.Id);
+  Assert.Equal(m.ValidUntil, next.ValidFrom);
+  Assert.Equal(m.Id, next.RenewalOf.Id);
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_holder_is_told_ten_days_before_the_end_and_it_ends_on_the_day() {
+  var m = SellMembership(Bo, Plan("Monthly"));
+  var end = m.ValidUntil.Value;
+  Workflow.Settle(m);
+  TestClock.Set(end.AddDays(-11));
+  Workflow.Settle(m);
+  Background.Settle();
+  Assert.Equal(0, HeardCount("endingsoon"));
+  TestClock.Set(end.AddDays(-9));
+  Workflow.Settle(m);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.Event == "endingsoon" && h.Detail == "Monthly"));
+  TestClock.Set(end.AddMinutes(1));
+  Workflow.Settle(m);
+  Background.Settle();
+  var ended = Membership.Single(x => x.Id == m.Id);
+  Assert.Equal(MembershipPhase.Ended, ended.Phase);
+  Assert.Equal("Ran out", ended.EndedBecause);
+  Assert.Equal(1, Heard.Count(h => h.Event == "ended" && h.Detail == "Monthly:Ran out"));
+  Assert.Equal(1, HeardCount("endingsoon"));
+}
+
+[Test(Pool)]
+[runas(Cass)]
+void a_card_that_runs_out_takes_its_visits_with_it_into_the_ledger() {
+  var m = SellMembership(Bo, Plan("Ten swims"));
+  runas(Lee) { CheckIn(Bo); }
+  var started = Membership.Single(x => x.Id == m.Id);
+  Workflow.Settle(m);
+  TestClock.Set(started.ValidUntil.Value.AddMinutes(1));
+  Workflow.Settle(m);
+  Workflow.Settle(m);
+  var line = CreditStatementOf(Bo).First();
+  Assert.Equal(CreditEntryKind.Expired, line.Kind);
+  Assert.Equal(-9, line.Change);
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_family_year_set_to_renew_is_renewed_by_the_pool_when_it_is_due() {
+  Membership? m = null;
+  runas(Cass) { m = SellMembership(Ada, Plan("Family year"), autoRenew: true); }
+  var end = m!.ValidUntil.Value;
+  Workflow.Settle(m!);
+  TestClock.Set(end.AddDays(-9));
+  Workflow.Settle(m!);
+  Background.Settle();
+  Assert.Equal(1, HeardCount("renewaldue"));
+  Assert.Equal(0, HeardCount("endingsoon"));
+  var next = Membership.Single(x => x.RenewalOf != null && x.RenewalOf.Id == m!.Id);
+  Assert.Equal(end, next.ValidFrom.Value);
+  Assert.True(next.AutoRenew);
+  SetAutoRenew(next, false);
+  Assert.False(Membership.Single(x => x.Id == next.Id).AutoRenew);
+}
+
+// ── who else a membership lets in ───────────────────────────────────────────────────────────────────────────────────
+
+[Test(Pool)]
+[runas(Ada)]
+void a_family_membership_lets_in_the_people_on_it_up_to_its_size() {
+  Membership? m = null;
+  runas(Cass) { m = SellMembership(Ada, Plan("Family year")); }
+  AddToMembership(m!, Bo);
+  var kid1 = KidOf("Sam Moreno");
+  var kid2 = KidOf("Ivy Moreno");
+  AddToMembership(m!, kid1);
+  AddToMembership(m!, kid2);
+  var fifth = KidOf("Max Moreno");
+  Assert.Equal("Family year is for 4 people, and has them.", Assert.Throws<ValidationException>(() => AddToMembership(m!, fifth)).Message);
+  runas(Lee) {
+    Assert.Equal(AdmissionState.Admitted, CheckIn(Bo).State);
+    Assert.Equal(AdmissionState.Admitted, CheckIn(kid1).State);
+    Assert.Equal(AdmissionState.Refused, CheckIn(fifth).State);
+  }
+  Assert.True(RemoveFromMembership(m!, Bo));
+  runas(Lee) { Assert.Equal(AdmissionState.Refused, CheckIn(Bo).State); }
+}
+
+[Test(Pool)]
+[runas(Ada)]
+void a_card_shared_with_a_child_spends_the_parents_visits_for_the_child() {
+  var m = Sold(Ada, "Ten swims");
+  var kid = KidOf("Sam Moreno");
+  Assert.Equal("Ten swims is for one person.", Assert.Throws<ValidationException>(() => AddToMembership(m, kid)).Message);
+  var own = Sold(kid, "Ten swims");
+  Assert.Equal(AdmissionState.Admitted, CheckIn(kid, "Turnstile").State);    // the parent checks the child in
+  Assert.Equal(9, VisitsLeftOn(Membership.Single(x => x.Id == own.Id)));
+  Assert.Equal(1, MembershipsOf(kid).Count);
+}
+
+/// A child's account, made by the signed-in parent (Osysharp.UserAccounts' managed accounts).
+User KidOf(string name) {
+  var made = MakeManagedAccount(name);
+  UnitOfWork.Commit();
+  Workflow.Settle(made);
+  return ManagedAccountRequest.Single(r => r.Id == made.Id).Account!;
+}
+
+/// Check `person` in as the lifeguard.
+Admission CheckInAsTheGate(Principal person) {
+  Admission? a = null;
+  runas(Lee) { a = CheckIn(person); }
+  return a!;
+}

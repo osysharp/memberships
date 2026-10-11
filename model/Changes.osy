@@ -1,0 +1,244 @@
+// Changes to a membership — pause, resume, a new end date, ending it, transferring it, undoing an admission — and the
+// people a shared membership lets in. Each change is a `MembershipChange` the caller makes; its run applies it, as the
+// system, in the same commit, so the trail of who changed what is not a log that might miss a path: it is the path.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+// ── who may ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Is this call the system — a run, a handler — rather than a person? Every function here is
+/// `[Authorize(IsAuthenticated)]` or stricter, which refuses a request with nobody signed in before its first line.
+bool MembershipsRunBySystem() { return CurrentPrincipal() == null; }
+
+/// Refuses unless the caller sells memberships, or the app's `allowed` setting lets the holder do it themselves.
+void MayChangeOwn(Membership m, bool allowed, string what) {
+  if (MembershipsRunBySystem() || SellsMemberships) { return; }
+  if (allowed && ActsForMember(m.Holder)) { return; }
+  throw new NotAuthorized($"Only the desk can {what} a membership here.");
+}
+
+// ── the changes ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Pause `membership` from now until `until` (at most what its plan still allows — the default), with `reason`. Its
+/// end moves by the days it was paused when it resumes. The desk may; a holder may when the app allows it
+/// (`MembersMayPause`). Throws the sentence to show otherwise.
+[Server, Authorize(IsAuthenticated)]
+public MembershipChange PauseMembership(Membership membership, DateTime? until = null, string reason = "") {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  MayChangeOwn(m, App.Setting<MembershipsSetup>().MembersMayPause, "pause");
+  var now = DateTime.UtcNow;
+  if (m.EndedAt != null) { throw new ValidationException($"{m.Plan.Name} has ended."); }
+  if (m.PausedAt != null) { throw new ValidationException($"{m.Plan.Name} is already paused."); }
+  var allowance = m.Plan.MaxPauseDays - m.PausedDays;
+  if (m.Plan.MaxPauseDays == 0) { throw new ValidationException($"{m.Plan.Name} cannot be paused."); }
+  if (allowance <= 0) { throw new ValidationException($"{m.Plan.Name} has used all {m.Plan.MaxPauseDays} days it may be paused."); }
+  var latest = now.AddDays(allowance);
+  var end = until ?? latest;
+  if (end <= now) { throw new ValidationException("Pause it until a day still to come."); }
+  if (end > latest) { throw new ValidationException($"{m.Plan.Name} may be paused for {allowance} more days — until {latest.ToString("d MMMM yyyy")} at most."); }
+  var change = new MembershipChange { Membership = m, Kind = MembershipChangeKind.Pause, Until = end, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return change;
+}
+
+/// Resume a paused `membership` now; its end moves by the days it was paused.
+[Server, Authorize(IsAuthenticated)]
+public MembershipChange ResumeMembership(Membership membership, string reason = "") {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  MayChangeOwn(m, App.Setting<MembershipsSetup>().MembersMayPause, "resume");
+  if (m.PausedAt == null) { throw new ValidationException($"{m.Plan.Name} is not paused."); }
+  var change = new MembershipChange { Membership = m, Kind = MembershipChangeKind.Resume, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return change;
+}
+
+/// Move `membership`'s end to `until` — goodwill, a closure, a correction — with `reason`, kept. Only the desk.
+[Server, Authorize(SellsMemberships)]
+public MembershipChange ExtendMembership(Membership membership, DateTime until, string reason) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  if (reason.Trim() == "") { throw new ValidationException("Say why — it is kept with the change."); }
+  if (m.EndedAt != null) { throw new ValidationException($"{m.Plan.Name} has ended; sell a new one instead."); }
+  if (m.ValidFrom == null) { throw new ValidationException($"{m.Plan.Name} has not started yet, so it has no end to move."); }
+  if (until <= DateTime.UtcNow) { throw new ValidationException("Choose an end still to come."); }
+  var change = new MembershipChange { Membership = m, Kind = MembershipChangeKind.Extend, Until = until, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return change;
+}
+
+/// End `membership` now — sold in error, refunded, cancelled — with `reason`, kept. What is left of its visits is void.
+/// `UnusedValueOf` says what it was worth first. Only the desk.
+[Server, Authorize(SellsMemberships)]
+public MembershipChange EndMembership(Membership membership, string reason) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  if (reason.Trim() == "") { throw new ValidationException("Say why — it is kept with the change."); }
+  if (m.EndedAt != null) { throw new ValidationException($"{m.Plan.Name} has already ended."); }
+  var change = new MembershipChange { Membership = m, Kind = MembershipChangeKind.End, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return change;
+}
+
+/// Give `membership` to `to`: it ends for its holder and goes on, unchanged — the same end, the visits left — as theirs.
+/// The desk may; a holder may when the app allows it (`HoldersMayTransfer`). Answers the change; its `Made` is the
+/// recipient's membership.
+[Server, Authorize(IsAuthenticated)]
+public MembershipChange TransferMembership(Membership membership, Principal to, string reason = "") {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  MayChangeOwn(m, App.Setting<MembershipsSetup>().HoldersMayTransfer, "transfer");
+  if (m.EndedAt != null) { throw new ValidationException($"{m.Plan.Name} has ended."); }
+  if (to.Id == m.Holder.Id) { throw new ValidationException("They already hold it."); }
+  var change = new MembershipChange { Membership = m, Kind = MembershipChangeKind.Transfer, To = to, Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return MembershipChange.Single(c => c.Id == change.Id);
+}
+
+/// Undo `admission` — a mistaken scan, a visit cancelled at the door: its visit goes back. Only those who admit.
+[Server, Authorize(AdmitsMembers)]
+public MembershipChange UndoAdmission(Admission admission, string reason = "") {
+  var a = Admission.Include(x => x.Membership).Single(x => x.Id == admission.Id);
+  if (a.State != AdmissionState.Admitted || a.Membership == null) { throw new ValidationException("Only an admission that let somebody in can be undone."); }
+  if (a.UndoneAt != null) { throw new ValidationException("That admission was already undone."); }
+  var change = new MembershipChange { Membership = a.Membership!, Kind = MembershipChangeKind.UndoAdmission, Admission = a,
+                                      Reason = reason.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return change;
+}
+
+// ── the people a shared membership lets in ──────────────────────────────────────────────────────────────────────────
+
+/// Let `person` in on `membership` too — a family member, a partner — up to its plan's `People`. The desk, or its
+/// holder (and whoever acts for them).
+[Server, Authorize(IsAuthenticated)]
+public MembershipMember AddToMembership(Membership membership, Principal person) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  MayChangeOwn(m, true, "add people to");
+  if (m.EndedAt != null) { throw new ValidationException($"{m.Plan.Name} has ended."); }
+  if (person.Id == m.Holder.Id || MembershipMember.Any(x => x.Membership == m && x.Member == person)) {
+    throw new ValidationException("They are already on it.");
+  }
+  var on = MembershipMember.Count(x => x.Membership == m) + 1;
+  if (on >= m.Plan.People) {
+    throw new ValidationException(m.Plan.People == 1 ? $"{m.Plan.Name} is for one person." : $"{m.Plan.Name} is for {m.Plan.People} people, and has them.");
+  }
+  var added = new MembershipMember { Membership = m, Member = person, AddedBy = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  return added;
+}
+
+/// Take `person` off `membership`. The desk, or its holder.
+[Server, Authorize(IsAuthenticated)]
+public bool RemoveFromMembership(Membership membership, Principal person) {
+  var m = Membership.Single(x => x.Id == membership.Id);
+  MayChangeOwn(m, true, "take people off");
+  var row = MembershipMember.FirstOrDefault(x => x.Membership == m && x.Member == person);
+  if (row == null) { return false; }
+  row.Delete();
+  UnitOfWork.Commit();
+  return true;
+}
+
+// ── erasure ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Remove every membership `person` holds — with its changes, the people on it and every check-in on it — their own
+/// check-ins on anybody's, and their place on others' memberships: a privacy erasure (Osysharp.Privacy.Memberships
+/// calls it). The visits on a counted one are Osysharp.PrepaidCredits' and go with that kit's erasure. Answers how
+/// many rows went.
+[Server, Authorize(SellsMemberships)]
+[SuppressWarning("cost-unbounded-read")]   // an erasure takes every row of one person, however many there are
+public int EraseMembershipsOf(Principal person) {
+  var n = 0;
+  var held = Membership.Where(m => m.Holder == person).Select(m => m.Id).ToList();
+  foreach (var a in Admission.Where(a => a.Person == person || (a.Membership != null && held.Contains(a.Membership.Id))).ToList()) { a.Delete(); n = n + 1; }
+  foreach (var c in MembershipChange.Where(c => held.Contains(c.Membership.Id) || c.To == person).ToList()) { c.Delete(); n = n + 1; }
+  foreach (var x in MembershipMember.Where(x => x.Member == person || held.Contains(x.Membership.Id)).ToList()) { x.Delete(); n = n + 1; }
+  // Another person's membership made from one of these (a transfer) forgets where it came from.
+  foreach (var c in MembershipChange.Where(c => c.Made != null && held.Contains(c.Made.Id)).ToList()) { c.Made = null; }
+  foreach (var m in Membership.Where(m => !held.Contains(m.Id) && ((m.RenewalOf != null && held.Contains(m.RenewalOf.Id))
+                                       || (m.TransferredFrom != null && held.Contains(m.TransferredFrom.Id)))).ToList()) {
+    m.RenewalOf = null;
+    m.TransferredFrom = null;
+  }
+  foreach (var m in Membership.Where(m => held.Contains(m.Id)).ToList()) { m.RenewalOf = null; m.TransferredFrom = null; }
+  UnitOfWork.Commit();
+  foreach (var m in Membership.Where(m => held.Contains(m.Id)).ToList()) { m.Delete(); n = n + 1; }
+  return n;
+}
+
+// ── the run that applies a change ───────────────────────────────────────────────────────────────────────────────────
+
+/// Applies a change, as the system, in the commit that made it.
+public workflow MembershipChangeRun {
+  Tracks    = MembershipChange.State;
+  Autostart = true;
+  Initial   = Applying;
+
+  state Applying {
+    enter { ApplyMembershipChange(this.Item); goto Applied; }
+  }
+
+  terminal success Applied { }
+}
+
+/// What each change does to its membership.
+void ApplyMembershipChange(MembershipChange c) {
+  var m = c.Membership;
+  var now = DateTime.UtcNow;
+  if (c.Kind == MembershipChangeKind.Pause) {
+    m.PausedAt = now;
+    m.ResumesOn = c.Until;
+    Raise(new MembershipPaused { Membership = m });
+  }
+  if (c.Kind == MembershipChangeKind.Resume) { ResumeNow(m); }
+  if (c.Kind == MembershipChangeKind.Extend) {
+    m.ValidUntil = c.Until;
+    m.NoticeFor = null;
+  }
+  if (c.Kind == MembershipChangeKind.End) {
+    m.EndedAt = now;
+    m.EndedBecause = c.Reason;
+    if (m.Credits != null) { VoidCredits(m.Credits!, "Membership ended: " + c.Reason); }
+    Raise(new MembershipEnded { Membership = m });
+  }
+  if (c.Kind == MembershipChangeKind.Transfer && c.To != null) {
+    var to = c.To!;
+    var left = m.Unlimited ? 0 : VisitsLeftOn(m);
+    var worth = UnusedValueOf(m);
+    // The visits move FIRST: moving them commits, and the new membership must already name its pack when it is made,
+    // or its life would grant it a fresh one.
+    CreditPack? moved = m.Credits != null && left > 0 ? TransferCredits(m.Credits!, left, to, "Membership transferred") : null;
+    var given = new Membership {
+      Holder = to, Plan = m.Plan, ValidFrom = m.ValidFrom, ValidUntil = m.ValidUntil, Unlimited = m.Unlimited,
+      Visits = left, Credits = moved, Price = worth, PausedAt = m.PausedAt, ResumesOn = m.ResumesOn,
+      PausedDays = m.PausedDays, TransferredFrom = m, SoldBy = c.By,
+    };
+    m.EndedAt = now;
+    m.EndedBecause = "transferred to " + to.DisplayName;
+    m.AutoRenew = false;
+    c.Made = given;
+    Raise(new MembershipTransferred { From = m, To = given });
+    Raise(new MembershipEnded { Membership = m });
+  }
+  if (c.Kind == MembershipChangeKind.UndoAdmission && c.Admission != null) {
+    var a = c.Admission!;
+    if (a.Spend != null) { RefundSpend(a.Spend!, "Admission undone"); }
+    a.UndoneAt = now;
+  }
+  MembershipLife.RaiseChanged(m);
+}
+
+/// A paused membership runs again: its end moves by the calendar days it was paused (paused and resumed the same day
+/// moves nothing).
+void ResumeNow(Membership m) {
+  if (m.PausedAt == null) { return; }
+  var days = Convert.ToInt((DateTime.UtcNow.Date - m.PausedAt.Value.Date).TotalDays);
+  if (days < 0) { days = 0; }
+  if (m.ValidUntil != null) { m.ValidUntil = m.ValidUntil.Value.AddDays(days); }
+  m.PausedDays = m.PausedDays + days;
+  m.PausedAt = null;
+  m.ResumesOn = null;
+  m.NoticeFor = null;
+  Raise(new MembershipResumed { Membership = m, Days = days });
+}

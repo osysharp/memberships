@@ -1,0 +1,87 @@
+// Each membership's life, as the system: its visits granted when it starts, the notice before it ends (or the call to
+// renew it), resuming at the end of a pause, and ending when its time is up — the visits left in it expire with it.
+//
+// ⚑ ONE CLOCK, MEASURED FROM NOW EACH TIME IT IS SET: whatever comes next — a resume, the notice, the end — and every
+//   change re-sets it (`Changed`), so a pause or an extension moves the notice and the end with it.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+public workflow MembershipLife {
+  Tracks    = Membership.Phase;
+  Autostart = true;
+  Initial   = Starting;
+
+  /// Its dates changed — the clock is set again.
+  event Changed();
+
+  state Starting {
+    enter { StartMembership(this.Item); goto Running; }
+  }
+
+  state Running {
+    Expire { Within = UntilMembershipTick(this.Item); }
+    on Expire {
+      if (TickMembership(this.Item)) { goto Ended; }
+      goto Running;
+    }
+    on Changed {
+      if (this.Item.EndedAt != null) { goto Ended; }
+      goto Running;
+    }
+  }
+
+  terminal success Ended { }
+}
+
+/// A counted membership's visits arrive as a pack of credits — once, scoped to it, at what each visit was paid.
+void StartMembership(Membership m) {
+  if (m.Unlimited || m.Credits != null || m.Visits == 0) { return; }
+  m.Credits = GrantCredits(m.Holder, m.Visits, m.Plan.Name, null, "membership:" + m.Id, "membership:" + m.Id,
+                           Math.Round(m.Price / m.Visits, 2), "Sold with the membership");
+}
+
+/// How long until something is due: the end of a pause, the notice, or the end itself (never below zero). A
+/// membership waiting for its first visit has nothing due.
+public TimeSpan UntilMembershipTick(Membership m) {
+  var now = DateTime.UtcNow;
+  if (m.EndedAt != null) { return TimeSpan.Zero; }
+  DateTime at;
+  if (m.PausedAt != null && m.ResumesOn != null) { at = m.ResumesOn.Value; }
+  else if (m.ValidUntil == null) { return TimeSpan.FromDays(36500); }
+  else {
+    var days = App.Setting<MembershipsSetup>().NoticeDays;
+    var notice = m.ValidUntil.Value.AddDays(-days);
+    at = days > 0 && m.NoticeFor != m.ValidUntil && notice > now ? notice : m.ValidUntil.Value;
+    if (days > 0 && m.NoticeFor != m.ValidUntil && notice <= now) { at = now; }
+  }
+  return at <= now ? TimeSpan.Zero : at - now;
+}
+
+/// Does what is due now; true when the membership has ended.
+bool TickMembership(Membership m) {
+  var now = DateTime.UtcNow;
+  if (m.EndedAt != null) { return true; }
+  if (m.PausedAt != null) {
+    if (m.ResumesOn != null && m.ResumesOn <= now) { ResumeNow(m); }
+    return false;
+  }
+  if (m.ValidUntil == null) { return false; }
+  if (m.ValidUntil <= now) {
+    m.EndedAt = m.ValidUntil;
+    m.EndedBecause = "Ran out";
+    if (m.Credits != null) { ExpireCredits(m.Credits!, m.Plan.Name + " ran out"); }
+    Raise(new MembershipEnded { Membership = m });
+    return true;
+  }
+  var days = App.Setting<MembershipsSetup>().NoticeDays;
+  if (days > 0 && m.NoticeFor != m.ValidUntil && m.ValidUntil.Value.AddDays(-days) <= now) {
+    m.NoticeFor = m.ValidUntil;
+    if (m.AutoRenew) { Raise(new MembershipRenewalDue { Membership = m }); }
+    else { Raise(new MembershipEndingSoon { Membership = m }); }
+  }
+  return false;
+}

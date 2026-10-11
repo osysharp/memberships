@@ -1,0 +1,29 @@
+// Osysharp.Memberships — what lets a person in: a day ticket, a monthly membership, a card of ten visits, a family pass.
+//
+// Plans with a price and a validity (days, weeks, months, years — or starting on the first visit), memberships sold to
+// a person, admission that uses a visit and never goes below zero, a plain answer to whether somebody may enter now and
+// why not, pausing that moves the end date, renewal and the notice before it, transfer, family members on one
+// membership, and what is left of one in money — with a my-memberships page, a desk page and a plans page.
+//
+// ⚑ THE TIME-BOUND LAYER ABOVE Osysharp.PrepaidCredits — not a second ledger. A counted membership's visits ARE a pack of
+//   credits (scoped to that membership): its statement, its refunds and its value owed are PrepaidCredits'. What this kit
+//   adds is time: when it starts, when it ends, pausing, renewal.
+// ⚑ EVERY CHANGE IS A RECORD FIRST. Pausing, resuming, extending, ending and transferring a membership, and undoing an
+//   admission, each make a `MembershipChange` — who, what, why — and its run applies it in the same commit. Each attempt
+//   to get in is an `Admission`, admitted or refused with the reason. Nobody edits or deletes either.
+// ⚑ THE APP SAYS WHO: `policy SellsMemberships => IsDesk;` (sell, plans, pause, end, transfer for anybody),
+//   `policy AdmitsMembers => IsGate;` (check people in), and who acts for whom (a parent for a child):
+//   `policy ActsForMember(Principal holder) => …;`. Members pausing, transferring or checking themselves in are settings.
+package Osysharp.Memberships {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "memberships and passes — day tickets, monthly and yearly memberships, cards of N visits (a pack of Osysharp.PrepaidCredits), starting on a date or on the first visit; admission that uses a visit, never goes below zero and says plainly why somebody may not enter; pauses that move the end date, extension, renewal (by hand or by the app's payment) and the notice before it ends, transfer, family members on one membership, and its unused value in money — every change and every attempt to enter recorded with who and why — with a my-memberships page, a desk page and a plans page.";
+  model "model/**/*.osy";
+  // The personal data its own fields hold (`[Classification(Personal.Content)]`): why a change was made.
+  personal Content;
+  use Osysharp.Identity@0;         // `Principal`: who holds a membership
+  use Osysharp.PrepaidCredits@0;   // a counted membership's visits
+  use Osysharp.Ui;                 // the pages
+  use Osysharp.Workflow;           // each membership's life, and the runs that apply a change or decide an admission
+  tests "tests";
+}

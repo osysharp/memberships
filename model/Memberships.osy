@@ -1,0 +1,288 @@
+// The data of Osysharp.Memberships — plans, memberships, the people who share one, the record of every change and every
+// attempt to enter — and what the kit asks its app and tells it.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+
+// ── what the app answers ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// THE SEAM — who sells memberships and looks after them: the plans, selling, pausing, extending, ending, renewing and
+/// transferring anybody's, and reading everybody's. Nobody, until the app says: `policy SellsMemberships => IsDesk;`.
+virtual policy SellsMemberships => false;
+
+/// THE SEAM — who lets people in: checks somebody in (using a visit) and reads everybody's memberships. Nobody, until the
+/// app says: `policy AdmitsMembers => IsGate;`.
+virtual policy AdmitsMembers => false;
+
+/// THE SEAM — whether the caller acts for `holder`: reads their memberships and, where the app's settings allow it,
+/// pauses, transfers or checks in for them. The holder themself, until the app widens it — a parent for a child:
+/// `policy ActsForMember(Principal holder) => holder == user || Guardian.Any(g => g.Child == holder && g.Parent == user);`.
+virtual policy ActsForMember(Principal holder) => holder == user;
+
+/// Whoever works the membership desk: those who sell and those who admit.
+virtual policy WorksMemberships => SellsMemberships || AdmitsMembers;
+
+/// Is the caller one of the people who share the membership `membership` (a family member on it)?
+policy SharesMembership(Guid membership) => MembershipMember.Any(x => x.Membership.Id == membership && x.Member == user);
+
+/// How the app runs memberships — `app.Memberships = new MembershipsSetup { … }`. Every member has a working default.
+[AppSetting("Memberships")]
+public class MembershipsSetup {
+  /// How many days before a membership ends its holder is told (`MembershipEndingSoon`), or — for one that renews —
+  /// the app is asked to renew it (`MembershipRenewalDue`). 0: neither.
+  public int NoticeDays = 7;
+  /// Whether a holder may pause their own membership (within its plan's `MaxPauseDays`). Staff who sell always may.
+  public bool MembersMayPause = false;
+  /// Whether a holder may give their membership to somebody else. Staff who sell always may.
+  public bool HoldersMayTransfer = false;
+  /// Whether a person may check themselves in (a kiosk, a phone at the door). Those who admit always may.
+  public bool MembersCheckIn = false;
+}
+
+// ── the data ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a plan's length is counted in.
+public enum PlanPeriod {
+  [Label("Day")] Day,
+  [Label("Week")] Week,
+  [Label("Month")] Month,
+  [Label("Year")] Year,
+}
+
+/// A kind of membership on sale: "Day ticket" (1 day), "Monthly" (1 month), "Ten visits" (10 visits within 12 months),
+/// "Family year" (1 year, up to 4 people).
+public entity MembershipPlan {
+  [Required, Unique, MaxLength(80)] string Name;
+  [MaxLength(300)] string Description = "";
+  /// What it costs — shown on the pages; money itself moves through the app's payments.
+  [Min(0)] decimal Price = 0;
+  [MaxLength(3)] string Currency = "";
+  /// How long it lasts: `Periods` × `Period`.
+  [Min(1), Max(120)] int Periods = 1;
+  PlanPeriod Period = PlanPeriod.Month;
+  /// Visits it holds; 0 lets its holder in as often as they like while it lasts.
+  [Min(0), Max(1000)] int Visits = 0;
+  /// It starts on the first visit rather than when it is sold — a ten-visit card, a gift.
+  bool StartsOnFirstVisit = false;
+  /// How many days in all it may be paused; 0: it cannot be.
+  [Min(0), Max(365)] int MaxPauseDays = 0;
+  /// How many people it lets in — 1, or more for a family or a pair. Besides the holder, the others are added by name.
+  [Min(1), Max(20)] int People = 1;
+  /// It can renew by itself (the app charges, then calls `RenewMembership`).
+  bool Renewable = false;
+  /// Withdrawn from sale: kept, because memberships already sold point at it.
+  bool OnSale = true;
+  int SortOrder = 0;
+
+  security {
+    allow read when IsAuthenticated || IsAnonymous;
+    allow create, update when SellsMemberships;
+  }
+}
+
+/// Where a membership is in its life — tracked by `MembershipLife`. ⚠ Appended, never inserted.
+public enum MembershipPhase {
+  [Label("Starting")] Starting,
+  [Label("Running")] Running,
+  [Label("Ended")] Ended,
+}
+
+/// One membership held by one person (and shared with those added to it). Its dates change only by its own changes;
+/// a counted one's visits are a pack of credits only admission spends.
+// Any signed-in person may hold one, so the holder's own rule is asked of every caller by design.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity Membership {
+  [Required, Immutable] Principal Holder;
+  [Required, Immutable] MembershipPlan Plan;
+  /// From when it lets its holder in. Null: from the first visit.
+  DateTime? ValidFrom;
+  /// Until when — moved by a pause or an extension. Null until it starts.
+  DateTime? ValidUntil;
+  [Immutable] bool Unlimited = true;
+  /// The visits it came with (0 when unlimited).
+  [Immutable, Min(0)] int Visits = 0;
+  /// The visits, as a pack of Osysharp.PrepaidCredits — granted by its life when it starts.
+  CreditPack? Credits;
+  /// What was paid for it.
+  [Immutable, Min(0)] decimal Price = 0;
+  /// Makes a sale idempotent: the same reference never sells a second one — an order line, a renewal.
+  [Unique, Immutable, MaxLength(200)] string? Reference;
+  [Immutable] DateTime SoldAt = DateTime.UtcNow;
+  [Immutable] Principal? SoldBy;
+  /// Paused since — and until when.
+  DateTime? PausedAt;
+  DateTime? ResumesOn;
+  /// Days it has been paused in all — what its plan's `MaxPauseDays` is measured against.
+  [Min(0)] int PausedDays = 0;
+  /// Renew it when it ends — the app charges and calls `RenewMembership`.
+  bool AutoRenew = false;
+  Membership? RenewalOf;
+  Membership? TransferredFrom;
+  DateTime? EndedAt;
+  [MaxLength(200)] string EndedBecause = "";
+  /// The end its holder was last told about, so each end is told once.
+  DateTime? NoticeFor;
+  MembershipPhase Phase;          // no default — MembershipLife owns it
+
+  security {
+    allow read when IsAuthenticated where ActsForMember(Holder) || SharesMembership(Id);
+    allow read when WorksMemberships;
+    allow create when SellsMemberships;
+    allow update when IsAuthenticated where ActsForMember(Holder);
+    allow update when SellsMemberships;
+    deny create except via SellMembership;
+    deny update AutoRenew except via SetAutoRenew;
+    deny update RenewalOf, TransferredFrom except via EraseMembershipsOf;
+    deny update ValidFrom, ValidUntil, Credits, PausedAt, ResumesOn, PausedDays, EndedAt, EndedBecause, NoticeFor;
+    allow delete when SellsMemberships;
+    deny delete except via EraseMembershipsOf;
+  }
+}
+
+/// Somebody else a membership lets in — a family member, a partner.
+// Any signed-in person may be on one, so the member's own rule is asked of every caller by design.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity MembershipMember {
+  [Required, Immutable] Membership Membership;
+  [Required, Immutable] Principal Member;
+  [Immutable] DateTime AddedAt = DateTime.UtcNow;
+  [Immutable] Principal? AddedBy;
+
+  security {
+    allow read when IsAuthenticated where Member == user || ActsForMember(Membership.Holder);
+    allow read when WorksMemberships;
+    allow create, delete when IsAuthenticated;
+    deny create except via AddToMembership;
+    deny delete except via RemoveFromMembership, EraseMembershipsOf;
+  }
+}
+
+/// What a change does. ⚠ Appended, never inserted.
+public enum MembershipChangeKind {
+  [Label("Paused")] Pause,
+  [Label("Resumed")] Resume,
+  [Label("End date changed")] Extend,
+  [Label("Ended")] End,
+  [Label("Transferred")] Transfer,
+  [Label("Admission undone")] UndoAdmission,
+}
+
+/// Where a change stands — tracked by `MembershipChangeRun`, which applies it in the commit that made it.
+public enum MembershipChangeState {
+  [Label("Applying")] Applying,
+  [Label("Applied")] Applied,
+}
+
+/// A change to a membership, kept: who made it, what, until when, and why. Made only by the kit's functions; its run
+/// applies it in the same commit. Nobody edits or deletes one.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity MembershipChange {
+  [Required, Immutable] Membership Membership;
+  [Required, Immutable] MembershipChangeKind Kind;
+  /// A pause's end, an extension's new end date.
+  [Immutable] DateTime? Until;
+  /// Whom a transfer gives it to.
+  [Immutable] Principal? To;
+  /// The admission an undo is about.
+  [Immutable] Admission? Admission;
+  [Immutable, MaxLength(300), Classification(Personal.Content)] string Reason = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+  [Immutable] Principal? By;
+  /// What a transfer made — the recipient's membership.
+  Membership? Made;
+  MembershipChangeState State;    // no default — MembershipChangeRun owns it
+
+  security {
+    allow read when IsAuthenticated where ActsForMember(Membership.Holder);
+    allow read when WorksMemberships;
+    allow create when IsAuthenticated;
+    deny create except via PauseMembership, ResumeMembership, ExtendMembership, EndMembership, TransferMembership, UndoAdmission;
+    deny update Made except via EraseMembershipsOf;
+    allow delete when SellsMemberships;
+    deny delete except via EraseMembershipsOf;
+  }
+}
+
+/// How an attempt to enter went — tracked by `AdmissionDecision`, which decides it in the commit that made it.
+public enum AdmissionState {
+  [Label("Deciding")] Deciding,
+  [Label("Admitted")] Admitted,
+  [Label("Refused")] Refused,
+}
+
+/// One attempt to enter: who, where, when, on which membership — admitted (a visit used) or refused, with the reason.
+[SuppressWarning("cost-row-rule-asked-of-every-caller")]
+public entity Admission {
+  [Required, Immutable] Principal Person;
+  /// The membership they came in on (or, refused, the one the reason is about).
+  Membership? Membership;
+  [Immutable, MaxLength(80), Classification(Personal.Content)] string Place = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// Who let them in — the desk, or the person at a kiosk.
+  [Immutable] Principal? By;
+  /// The visit it used (null for an unlimited membership).
+  CreditSpend? Spend;
+  /// Visits left on the membership after it.
+  int VisitsLeft = 0;
+  bool Unlimited = false;
+  /// Refused: why, in a sentence to read out.
+  [MaxLength(300), Classification(Personal.Content)] string Reason = "";
+  /// Undone (a mistaken scan): the visit went back.
+  DateTime? UndoneAt;
+  AdmissionState State;           // no default — AdmissionDecision owns it
+
+  security {
+    allow read when IsAuthenticated where ActsForMember(Person);
+    allow read when WorksMemberships;
+    allow create when IsAuthenticated;
+    deny create except via CheckIn;
+    deny update Membership, Spend, VisitsLeft, Unlimited, Reason, UndoneAt;
+    allow delete when SellsMemberships;
+    deny delete except via EraseMembershipsOf;
+  }
+}
+
+// ── what the kit tells the app ──────────────────────────────────────────────────────────────────────────────────────
+
+/// A membership was sold (or renewed, or made by a transfer).
+[Event("Membership sold")]
+public sealed class MembershipSold { public Membership Membership; }
+
+/// Somebody was let in.
+[Event("Member admitted")]
+public sealed class MemberAdmitted { public Admission Admission; }
+
+/// Somebody was refused at the door — `Admission.Reason` says why.
+[Event("Admission refused")]
+public sealed class AdmissionRefused { public Admission Admission; }
+
+/// A membership was paused.
+[Event("Membership paused")]
+public sealed class MembershipPaused { public Membership Membership; }
+
+/// A paused membership runs again; its end moved by the days it was paused.
+[Event("Membership resumed")]
+public sealed class MembershipResumed { public Membership Membership; public int Days; }
+
+/// A membership that does not renew ends within the app's notice — the moment to tell its holder.
+[Event("Membership ending soon")]
+public sealed class MembershipEndingSoon { public Membership Membership; }
+
+/// A membership set to renew ends within the app's notice: the app charges for the next one and calls
+/// `RenewMembership` — or, when the payment fails, tells the holder.
+[Event("Membership renewal due")]
+public sealed class MembershipRenewalDue { public Membership Membership; }
+
+/// A membership was renewed: `Next` follows `From`.
+[Event("Membership renewed")]
+public sealed class MembershipRenewed { public Membership From; public Membership Next; }
+
+/// A membership ended — ran out, was ended by staff, or was transferred (`EndedBecause` says which).
+[Event("Membership ended")]
+public sealed class MembershipEnded { public Membership Membership; }
+
+/// A membership was given to somebody else: `To` is theirs now.
+[Event("Membership transferred")]
+public sealed class MembershipTransferred { public Membership From; public Membership To; }

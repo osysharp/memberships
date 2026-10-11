@@ -1,0 +1,74 @@
+// Letting somebody in. An `Admission` is made for every attempt; its run decides it, as the system, in the same commit:
+// on an unlimited membership nothing is used, on a counted one a visit is spent from its pack — never below zero — and
+// a membership that starts on its first visit starts. A refusal is kept too, with the sentence the desk reads out.
+
+namespace Osysharp.Memberships;
+
+using Osysharp.Identity;
+using Osysharp.PrepaidCredits;
+using Osysharp.Workflow;
+
+/// Let `person` in at `place`: answers the admission — `State` Admitted (with the visits left) or Refused (with
+/// `Reason`). Those who admit may check anybody in; a person may check themselves in (or somebody they act for) when the
+/// app allows it (`MembersCheckIn`). In a test: `Assert.Equal(AdmissionState.Admitted, CheckIn(ada).State)`.
+[Server, Authorize(IsAuthenticated)]
+public Admission CheckIn(Principal person, string place = "") {
+  if (!AdmitsMembers && !(App.Setting<MembershipsSetup>().MembersCheckIn && ActsForMember(person))) {
+    throw new NotAuthorized("Only the desk can check somebody in here.");
+  }
+  var a = new Admission { Person = person, Place = place.Trim(), By = CurrentPrincipal() };
+  UnitOfWork.Commit();
+  var decided = Admission.Include(x => x.Membership.Plan).Single(x => x.Id == a.Id);
+  if (decided.State == AdmissionState.Admitted) { Raise(new MemberAdmitted { Admission = decided }); }
+  else { Raise(new AdmissionRefused { Admission = decided }); }
+  return decided;
+}
+
+/// Decides an admission, as the system, in the commit that made it.
+public workflow AdmissionDecision {
+  Tracks    = Admission.State;
+  Autostart = true;
+  Initial   = Deciding;
+
+  state Deciding {
+    enter {
+      if (DecideAdmission(this.Item)) { goto Admitted; }
+      goto Refused;
+    }
+  }
+
+  terminal success Admitted { }
+  terminal success Refused { }
+}
+
+/// Whether `a` lets its person in — writing what it used, or why not.
+bool DecideAdmission(Admission a) {
+  var entry = EntryFor(a.Person);
+  if (entry.Membership != null) { a.Membership = Membership.Single(m => m.Id == entry.Membership.Value); }
+  if (!entry.CanEnter) { a.Reason = entry.Reason; return false; }
+  var m = a.Membership!;
+  var now = DateTime.UtcNow;
+  if (m.ValidFrom == null) {
+    // A membership that starts on its first visit starts now.
+    m.ValidFrom = now;
+    m.ValidUntil = MembershipEndFrom(m.Plan, now);
+    MembershipLife.RaiseChanged(m);
+  }
+  if (!m.Unlimited) {
+    var spend = SpendCredits(m.Holder, 1, m.Plan.Name + (a.Place != "" ? " — " + a.Place : ""), "admission:" + a.Id,
+                             MembershipScope(m), a.Person.Id == m.Holder.Id ? null : a.Person);
+    if (spend == null) { a.Reason = $"{m.Plan.Name} has no visits left."; return false; }
+    a.Spend = spend;
+    a.VisitsLeft = VisitsLeftOn(m);
+  }
+  a.Unlimited = m.Unlimited;
+  return true;
+}
+
+/// Today's attempts to enter (at most `take`), newest first — the door log.
+[Server, Authorize(WorksMemberships)]
+public List<Admission> AdmissionsToday(int take = 100) {
+  var since = DateTime.UtcNow.Date;
+  return Admission.Include(a => a.Person).Include(a => a.Membership.Plan).Where(a => a.At >= since)
+    .OrderByDescending(a => a.At).Take(take).ToList();
+}
