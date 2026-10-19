@@ -15,8 +15,8 @@
 //   `policy AdmitsMembers => IsGate;` (check people in), and who acts for whom (a parent for a child):
 //   `policy ActsForMember(Principal holder) => …;`. Members pausing, transferring or checking themselves in are settings.
 package Osysharp.Memberships {
-  version     "0.1.0";
-  minPlatform "0.9.0";
+  version     "0.2.0";
+  minPlatform "0.14.0";
   summary     "memberships and passes — day tickets, monthly and yearly memberships, cards of N visits (a pack of Osysharp.PrepaidCredits), starting on a date or on the first visit; admission that uses a visit, never goes below zero and says plainly why somebody may not enter; pauses that move the end date, extension, renewal (by hand or by the app's payment) and the notice before it ends, transfer, family members on one membership, and its unused value in money — every change and every attempt to enter recorded with who and why — with a my-memberships page, a desk page and a plans page.";
   model "model/**/*.osy";
   // The personal data its own fields hold (`[Classification(Personal.Content)]`): why a change was made.

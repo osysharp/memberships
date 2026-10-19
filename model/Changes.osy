@@ -182,7 +182,10 @@ public workflow MembershipChangeRun {
   terminal success Applied { }
 }
 
-/// What each change does to its membership.
+/// What each change does to its membership. Called by the change's own run (`MembershipChangeRun`) alone, and named
+/// in the rules for what only it and the kit's other named functions write: the membership a transfer makes, the end
+/// of the old one's renewal, and the change's own `Made`.
+[Server, Authorize(SellsMemberships)]
 void ApplyMembershipChange(MembershipChange c) {
   var m = c.Membership;
   var now = DateTime.UtcNow;

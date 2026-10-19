@@ -132,8 +132,9 @@ public entity Membership {
     allow create when SellsMemberships;
     allow update when IsAuthenticated where ActsForMember(Holder);
     allow update when SellsMemberships;
-    deny create except via SellMembership;
-    deny update AutoRenew except via SetAutoRenew;
+    // …and `ApplyMembershipChange`, the change's own run: a transfer makes the receiver's membership and ends this one's renewal.
+    deny create except via SellMembership, ApplyMembershipChange;
+    deny update AutoRenew except via SetAutoRenew, ApplyMembershipChange;
     deny update RenewalOf, TransferredFrom except via EraseMembershipsOf;
     deny update ValidFrom, ValidUntil, Credits, PausedAt, ResumesOn, PausedDays, EndedAt, EndedBecause, NoticeFor;
     allow delete when SellsMemberships;
@@ -199,7 +200,7 @@ public entity MembershipChange {
     allow read when WorksMemberships;
     allow create when IsAuthenticated;
     deny create except via PauseMembership, ResumeMembership, ExtendMembership, EndMembership, TransferMembership, UndoAdmission;
-    deny update Made except via EraseMembershipsOf;
+    deny update Made except via EraseMembershipsOf, ApplyMembershipChange;
     allow delete when SellsMemberships;
     deny delete except via EraseMembershipsOf;
   }

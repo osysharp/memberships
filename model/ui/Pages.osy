@@ -201,7 +201,7 @@ public component MyMemberships() {
       MembershipEntryBanner(view.Entry, "You can come in", "You cannot come in right now");
       if (done != "") { Alert(done, tone: Tone.Success); }
       if (problem != "") { Alert(problem, tone: Tone.Danger); }
-      Stack(gap: 3, role: UiRole.List, label: "Memberships") {
+      Stack(gap: 3, role: (view.Cards.Count == 0) ? UiRole.Group : UiRole.List, label: "Memberships") {
         if (view.Cards.Count == 0) { EmptyState("No membership yet", body: "Memberships you buy, or that you are added to, appear here."); }
         foreach (var c in view.Cards) {
           MembershipCardView(c) {
@@ -266,7 +266,7 @@ public component AdmissionList(List<AdmissionLine> lines, string title, bool sho
     Stack(gap: 2) {
       SectionLabel(title);
       Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-            role: UiRole.List, label: title) {
+            role: (lines.Count == 0) ? UiRole.Group : UiRole.List, label: title) {
         if (lines.Count == 0) { Box(p: 5) { EmptyState("Nobody yet", body: "Each time somebody comes in, or is turned away, it is listed here."); } }
         foreach (var l in lines) {
           Row(gap: 3, align: Align.Center, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
@@ -414,7 +414,7 @@ public component MembershipsDesk() {
           }
           if (done != "") { Alert(done, tone: Tone.Success); }
           if (problem != "") { Alert(problem, tone: Tone.Danger); }
-          Stack(gap: 3, role: UiRole.List, label: "Memberships") {
+          Stack(gap: 3, role: (view.Cards.Count == 0) ? UiRole.Group : UiRole.List, label: "Memberships") {
             if (view.Cards.Count == 0) { EmptyState("No membership", body: "Sell one to let them in."); }
             foreach (var c in view.Cards) {
               MembershipCardView(c) {
@@ -541,7 +541,7 @@ public component MembershipPlans() {
       Row(gap: 2, justify: Justify.End) { Button("Add a plan", onPress: StartNew, tone: Tone.Primary, size: Size.Sm); }
       if (done != "") { Alert(done, tone: Tone.Success); }
       Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden,
-            role: UiRole.List, label: "Plans") {
+            role: (plans.Count == 0) ? UiRole.Group : UiRole.List, label: "Plans") {
         if (plans.Count == 0) { Box(p: 5) { EmptyState("No plans yet", body: "Add the first thing you sell — a day ticket, a monthly membership, a card of visits."); } }
         foreach (var p in plans) {
           Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap, px: 4, py: 3, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: p.Name) {
