@@ -91,3 +91,92 @@ and their check-ins are in their copy of their data and are erased when they ask
 
 [github.com/osysharp/memberships](https://github.com/osysharp/memberships). Its tests (`tests/`) are a public pool's:
 every behaviour above, each seam shown, and the pages under `osy test --pixels`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+[Test(Pool)]
+[runas(Cass)]
+void a_monthly_membership_runs_a_month_from_today() {
+  var m = SellMembership(Ada, Plan("Monthly"), "till-1");
+  Assert.True(m.Unlimited);
+  Assert.True(m.ValidUntil > DateTime.UtcNow.AddDays(27));
+  Assert.True(m.ValidUntil < DateTime.UtcNow.AddDays(32));
+  Assert.Equal(45m, m.Price);
+  Assert.True(EntryFor(Ada).CanEnter);
+}
+```
+
+From [`tests/admission.test.osy`](tests/admission.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+[Test(Pool)]
+[runas(Ada)]
+void a_swimmer_pauses_their_monthly_and_its_end_moves_by_the_days_it_was_paused() {
+  var m = Sold(Ada, "Monthly");
+  var end = m.ValidUntil.Value;
+  PauseMembership(m, DateTime.UtcNow.AddDays(14), "Broken arm");
+  var paused = CheckInAsTheGate(Ada);
+  Assert.Equal(AdmissionState.Refused, paused.State);
+  Assert.True(paused.Reason.StartsWith("Monthly is paused until "));
+  TestClock.Advance(TimeSpan.FromDays(6));
+  ResumeMembership(m, "Back early");
+  var resumed = Membership.Single(x => x.Id == m.Id);
+  Assert.Equal(end.AddDays(6), resumed.ValidUntil.Value);
+  Assert.Equal(6, resumed.PausedDays);
+  Assert.Equal(AdmissionState.Admitted, CheckInAsTheGate(Ada).State);
+  var trail = ChangesTo(m);
+  Assert.Equal(MembershipChangeKind.Resume, trail[0].Kind);
+  Assert.Equal("Broken arm", trail[1].Reason);
+  Assert.Equal(Ada.Id, trail[1].By.Id);
+}
+```
+
+From [`tests/changes.test.osy`](tests/changes.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.UserAccounts;
+using Osysharp.PrepaidCredits;
+using Osysharp.Memberships;
+using Osysharp.Workflow;
+
+[Test(Pool)]
+[runas(Cass)]
+void even_the_cashier_cannot_write_a_membership_s_dates_or_visits_directly() {
+  var m = SellMembership(Ada, Plan("Ten swims"));
+  Assert.Denied(() => { m.ValidUntil = DateTime.UtcNow.AddYears(5); UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.ValidFrom = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.PausedDays = 0; m.PausedAt = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.EndedAt = DateTime.UtcNow; UnitOfWork.Commit(); });
+  Assert.Denied(() => { new Membership { Holder = Bo, Plan = Plan("Monthly") }; UnitOfWork.Commit(); });
+  Assert.Denied(() => { m.Delete(); UnitOfWork.Commit(); });
+}
+```
+
+From [`tests/security.test.osy`](tests/security.test.osy).
+
+## Learn more
+
+- [The Osysharp.Memberships reference](https://osysharp.com/reference/ui/memberships-kit/)
+- [Osysharp.Memberships in the package catalogue](https://osysharp.com/packages/#osysharp-memberships)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
